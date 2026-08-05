@@ -1,6 +1,6 @@
 # SprinkleScriptMaker
 
-**SprinkleScriptMaker** is a lightweight, modern C++ desktop application designed to easily create, edit, and export script files (`.vdf` / `.txt`) for the **Sprinkle Tool** in Valve's Hammer and Hammer++ Editors.
+**SprinkleScriptMaker** is a lightweight, modern C++ desktop application designed to easily create, edit, and export script files (`.txt`) for the **Sprinkle Tool** in Valve's Hammer and Hammer++ Editors.
 
 Writing Sprinkle configuration files manually can be error-prone and tedious. This tool streamlines the level design workflow by providing an intuitive user interface to configure prop categories, base rules, and model probabilities.
 
@@ -16,7 +16,7 @@ Writing Sprinkle configuration files manually can be error-prone and tedious. Th
 
 ## ✨ Planned Features
 
-- [x] Modern VDF / KeyValues script generation
+- [x] Modern KeyValues `.txt` script generation
 - [ ] User-friendly GUI for defining presets, base parameters, and probabilities
 - [ ] Direct VPK browsing for Source Engine game assets
 - [ ] 3D Model & Material preview
