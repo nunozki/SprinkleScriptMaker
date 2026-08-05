@@ -20,3 +20,5 @@ FetchContent_MakeAvailable(sourcepp)
 add_executable(SprinkleScriptMaker src/main.cpp)
 
 target_link_libraries(SprinkleScriptMaker PRIVATE sourcepp)
+
+target_include_directories(SprinkleScriptMaker PRIVATE ${sourcepp_SOURCE_DIR}/include)
