@@ -17,7 +17,11 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(sourcepp)
 
-add_executable(SprinkleScriptMaker src/main.cpp)
+add_executable(SprinkleScriptMaker 
+    src/main.cpp
+    src/headers/SprinkleReader.h
+    src/headers/SprinkleWriter.h
+)
 
 target_link_libraries(SprinkleScriptMaker PRIVATE sourcepp)
 
