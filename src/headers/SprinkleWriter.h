@@ -3,23 +3,25 @@
 #include <vector>
 #include <sstream>
 
+using namespace std;
+
 // 1. Structure to hold each variation's data
 struct SprinkleVariation {
-    int chance;
-    std::string model;
-    std::string skin = "";          // Optional, leave empty if not used
-    std::string ignorenormals = ""; // Optional, leave empty if not used
+    int chance = 0;
+    string model;
+    string skin = "";          // Optional, leave empty if not used
+    string ignorenormals = ""; // Optional, leave empty if not used
 };
 
 // 2. The Custom Writer Class
 class SprinkleWriter {
 public:
-    static std::string Generate(const std::string& presetName,
-        const std::string& baseClassname,
-        const std::string& baseGrid,
-        const std::vector<SprinkleVariation>& variations)
+    static string Generate(const string& presetName,
+        const string& baseClassname,
+        const string& baseGrid,
+        const vector<SprinkleVariation>& variations)
     {
-        std::ostringstream out;
+        ostringstream out;
 
         // Root
         out << "\"" << presetName << "\"\n";

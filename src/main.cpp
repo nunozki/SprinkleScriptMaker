@@ -1,12 +1,28 @@
+#include "headers/ViewportFBO.h" 
+#include "headers/portable-file-dialogs.h"
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
+#include <imgui_stdlib.h>
+#include <GLFW/glfw3.h>
 #include <iostream>
+#include <fstream>
+#include <vector>
 #include "headers/SprinkleWriter.h"
 #include "headers/SprinkleReader.h"
+#include "headers/SteamDetector.h"
+#include "headers/SourceAssetManager.h" 
+#include "headers/ModelRenderer.h"
+#include <algorithm>
+#include <cmath>
 
-int main() {
-    std::cout << "Testing Custom Sprinkle Writer...\n" << std::endl;
+using namespace std;
+
+void test() {
+    cout << "Testing Custom Sprinkle Writer...\n" << endl;
 
     // Build the list of variations (replicating your Jungle Foliage example)
-    std::vector<SprinkleVariation> myVariations;
+    vector<SprinkleVariation> myVariations;
 
     myVariations.push_back({ 10, "models/props_island/island_plant01.mdl", "", "1" });
     myVariations.push_back({ 10, "models/props_island/island_plant02.mdl", "0", "1" });
@@ -14,7 +30,7 @@ int main() {
     myVariations.push_back({ 10, "models/props_island/island_plant04.mdl", "", "1" });
 
     // Generate the text
-    std::string outputText = SprinkleWriter::Generate(
+    string outputText = SprinkleWriter::Generate(
         "Example: Jungle Foliage",
         "prop_static",
         "64 64",
@@ -22,45 +38,538 @@ int main() {
     );
 
     // Print the perfect format
-    std::cout << outputText << std::endl;
+    cout << outputText << endl;
 
-    std::string presetName;
-    std::string classname;
-    std::string grid;
-    std::vector<SprinkleVariation> uiVariations;
+    string presetName;
+    string classname;
+    string grid;
+    vector<SprinkleVariation> uiVariations;
 
-    std::cout << "Loading script..." << std::endl;
+    cout << "Loading script..." << endl;
 
     bool success = SprinkleReader::Load("jungle_foliage.txt", presetName, classname, grid, uiVariations);
     if (success) {
-        std::cout << "Successfully loaded: " << presetName << std::endl;
-        std::cout << "Models found: " << uiVariations.size() << std::endl;
+        cout << "Successfully loaded: " << presetName << endl;
+        cout << "Models found: " << uiVariations.size() << endl;
 
         // Example: The user edited the first model in the interface (changed chance to 50)
         if (!uiVariations.empty()) {
             uiVariations[0].chance = 50;
-            std::cout << "User changed the first model's chance to 50." << std::endl;
+            cout << "User changed the first model's chance to 50." << endl;
         }
 
         // 1. Generate the updated formatted text
-        std::string newOutputText = SprinkleWriter::Generate(presetName, classname, grid, uiVariations);
+        string newOutputText = SprinkleWriter::Generate(presetName, classname, grid, uiVariations);
 
         // 2. Save it back to the disk (overwriting or creating a new file)
-        std::ofstream outFile("jungle_foliage_edited.txt");
+        ofstream outFile("jungle_foliage_edited.txt");
 
         if (outFile.is_open()) {
             outFile << newOutputText;
             outFile.close();
-            std::cout << "\nSuccess! The edited script was saved to 'jungle_foliage_edited.txt'." << std::endl;
+            cout << "\nSuccess! The edited script was saved to 'jungle_foliage_edited.txt'." << endl;
         }
         else {
-            std::cout << "\nError: Could not open the file to write." << std::endl;
+            cout << "\nError: Could not open the file to write." << endl;
         }
     }
     else {
-        std::cout << "Could not find or read the file. Check if 'jungle_foliage.txt' exists in the folder." << std::endl;
+        cout << "Could not find or read the file. Check if 'jungle_foliage.txt' exists in the folder." << endl;
     }
 
-    std::cin.get();
+    cin.get();
+    //return 0;
+}
+
+int main() {
+    // Game Asset Indexer state variables
+    vector<std::string> indexedModels;
+    bool isIndexingAssets = false;
+    string searchFilter = "";
+    int lastSelectedGameIndex = -1;
+    bool gameJustChanged = false; // Set when the selected game changes, so stale model selection can be cleared
+
+    // GLFW and ImGui initialization
+    if (!glfwInit()) return -1;
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    GLFWwindow* window = glfwCreateWindow(1024, 768, "Sprinkle Script Maker", NULL, NULL);
+    if (!window) { glfwTerminate(); return -1; }
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 130");
+
+    string uiPresetName = "Example: Jungle Foliage";
+    string uiClassname = "prop_static";
+    string uiGrid = "64 64";
+    vector<SprinkleVariation> uiVariations;
+    string statusMessage = "Ready."; // To notify if saving was successful
+
+    // Detect Windows DPI/Scale and apply it to the ImGui interface
+    float xscale, yscale;
+    glfwGetWindowContentScale(window, &xscale, &yscale);
+    ImGui::GetStyle().ScaleAllSizes(xscale);
+    ImGui::GetIO().FontGlobalScale = xscale; // Increases the base text size to match Windows scale
+
+    // ----------------------------------------------------
+    // INITIALIZE STEAM DETECTION
+    // ----------------------------------------------------
+    vector<SourceGame> detectedGames = SteamDetector::GetInstalledGames();
+    int selectedGameIndex = 0; // Keeps track of which game the user chose
+
+    // ----------------------------------------------------
+    // 3D PREVIEW VIEWPORT (FBO + orbit camera state)
+    // ----------------------------------------------------
+    static ViewportFBO previewFBO;
+    static bool fboInitialized = false;
+
+    static float cameraYaw = 0.0f;
+    static float cameraPitch = 20.0f;
+    static float cameraDistance = 150.0f;
+
+    // Real studio model (.mdl/.vtx/.vvd) preview, and the last path we loaded
+    // so we only reload/reparse when the selection actually changes.
+    static ModelRenderer previewModel;
+    static string lastLoadedModelPath;
+
+    // Render the preview at a higher pixel density than the on-screen panel
+    // (supersampling), so the image stays crisp. 2.0 = twice the resolution.
+    static constexpr float kPreviewResolutionScale = 2.0f;
+
+    // ----------------------------------------------------
+    // MAIN LOOP
+    // ----------------------------------------------------
+    while (!glfwWindowShouldClose(window)) {
+        glfwPollEvents();
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        // ----------------------------------------------------
+        // NEW CODE: LOCK UI TO THE MAIN WINDOW BORDERS
+        // ----------------------------------------------------
+        ImGuiViewport* viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(viewport->WorkPos);
+        ImGui::SetNextWindowSize(viewport->WorkSize);
+
+        // Setup flags to remove window decorations and lock its position
+        ImGuiWindowFlags window_flags = 0;
+        window_flags |= ImGuiWindowFlags_NoTitleBar;
+        window_flags |= ImGuiWindowFlags_NoCollapse;
+        window_flags |= ImGuiWindowFlags_NoResize;
+        window_flags |= ImGuiWindowFlags_NoMove;
+        window_flags |= ImGuiWindowFlags_NoBringToFrontOnFocus;
+        window_flags |= ImGuiWindowFlags_NoNavFocus;
+        // ----------------------------------------------------
+
+        // Your window now uses the flags to stay "pinned" to the background
+        ImGui::Begin("Sprinkle Tool Editor", nullptr, window_flags);
+
+        // --- GAME SELECTION MENU ---
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.0f, 1.0f), "Target Environment");
+
+        if (!detectedGames.empty()) {
+            string previewName = detectedGames[selectedGameIndex].name;
+
+            if (ImGui::BeginCombo("Detected Games", previewName.c_str())) {
+                for (int n = 0; n < detectedGames.size(); n++) {
+                    const bool isSelected = (selectedGameIndex == n);
+                    if (ImGui::Selectable(detectedGames[n].name.c_str(), isSelected)) {
+                        selectedGameIndex = n;
+                    }
+                    if (isSelected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+
+            // Trigger asset indexing if selected game changes or on initial boot
+            if (selectedGameIndex != lastSelectedGameIndex) {
+                lastSelectedGameIndex = selectedGameIndex;
+                indexedModels = SourceAssetManager::IndexGameModels(detectedGames[selectedGameIndex].path);
+                gameJustChanged = true; // Model selection/preview state below belongs to the old game and must be reset
+            }
+
+            ImGui::TextDisabled("Path: %s | Indexed Models: %d",
+                detectedGames[selectedGameIndex].path.c_str(),
+                (int)indexedModels.size());
+        }
+        ImGui::Separator();
+
+        // 1. Base Settings
+        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Base Settings");
+        ImGui::InputText("Preset Name", &uiPresetName);
+        ImGui::InputText("Classname", &uiClassname);
+        ImGui::InputText("Grid Size", &uiGrid);
+
+        ImGui::Separator();
+
+        // 2. Model List (Variations)
+        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Models & Variations");
+        if (ImGui::Button("+ Add New Model")) {
+            uiVariations.push_back({ 10, "models/props/new_model.mdl", "", "1" });
+        }
+
+        ImGui::Spacing();
+
+        bool hasErrors = false; // Flag to track if everything is correct
+
+        // Loop to draw a box for each model in the list
+        for (size_t i = 0; i < uiVariations.size(); ++i) {
+            ImGui::PushID(i); // ImGui needs a unique ID to distinguish each block
+
+            // Validate the model path (C++20 feature)
+            bool isPathValid = !uiVariations[i].model.empty() && uiVariations[i].model.ends_with(".mdl");
+            if (!isPathValid) {
+                hasErrors = true; // Block saving if at least one model is invalid
+            }
+
+            ImGui::InputInt("Chance", &uiVariations[i].chance);
+            ImGui::InputText("Model Path", &uiVariations[i].model);
+
+            // Optional: Draw a popup with matching indexed models if the user types
+            if (ImGui::IsItemActive() && !indexedModels.empty() && !uiVariations[i].model.empty()) {
+                ImGui::SetNextWindowPos(ImVec2(ImGui::GetItemRectMin().x, ImGui::GetItemRectMax().y));
+                ImGui::SetNextWindowSize(ImVec2(ImGui::GetItemRectSize().x, 200));
+
+                if (ImGui::Begin("##ModelSuggestions", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize)) {
+                    int matches = 0;
+                    for (const auto& mdl : indexedModels) {
+                        if (mdl.find(uiVariations[i].model) != std::string::npos) {
+
+                            if (ImGui::Selectable(mdl.c_str())) {
+                                uiVariations[i].model = mdl; // Fill input text
+
+                                // --- NEW: AUTO-DETECT SKINS ---
+                                int skinCount = SourceAssetManager::GetSkinCount(mdl);
+
+                                if (skinCount == 1) {
+                                    uiVariations[i].skin = "0"; // Only 1 skin exists, set to default
+                                }
+                                else if (skinCount > 1) {
+                                    // Let user know multiple exist by leaving blank or putting a hint
+                                    uiVariations[i].skin = "";
+                                }
+                                // ------------------------------
+                            }
+                            matches++;
+                            if (matches > 50) break;
+                        }
+                    }
+                    ImGui::End();
+                }
+            }
+
+            // Show a red warning if invalid
+            if (!isPathValid) {
+                ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "Error: Path must end with '.mdl' and cannot be empty!");
+            }
+
+            ImGui::InputText("Skin", &uiVariations[i].skin);
+            ImGui::InputText("Ignore Normals", &uiVariations[i].ignorenormals);
+
+            // Button to delete this model from the list
+            if (ImGui::Button("Remove Model")) {
+                uiVariations.erase(uiVariations.begin() + i);
+                ImGui::PopID();
+                break; // Stop the loop immediately to prevent a crash
+            }
+
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+
+        ImGui::Spacing();
+
+        // --- MODEL LISTING & SCRIPT EDITOR PANEL ---
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Model Selection & Script Editor");
+
+        static char searchBuffer[128] = "";
+        ImGui::InputText("Filter Models", searchBuffer, sizeof(searchBuffer));
+
+        static std::string selectedModelPath = "";
+        static int selectedVariationIndex = -1;
+
+        if (gameJustChanged) {
+            // The previously selected model/preview belonged to the old game's index,
+            // which no longer exists after re-indexing - clear it to avoid stale lookups.
+            selectedModelPath.clear();
+            gameJustChanged = false;
+        }
+
+        if (ImGui::BeginChild("ModelListRegion", ImVec2(0, 180), true, ImGuiWindowFlags_HorizontalScrollbar)) {
+            for (const auto& [modelPath, sourcePath] : SourceAssetManager::ModelLocations) {
+                if (strlen(searchBuffer) > 0) {
+                    if (modelPath.find(searchBuffer) == std::string::npos) {
+                        continue;
+                    }
+                }
+
+                int skinCount = SourceAssetManager::GetSkinCount(modelPath);
+                std::string label = modelPath + " (Skins: " + std::to_string(skinCount) + ")";
+
+                if (ImGui::Selectable(label.c_str(), selectedModelPath == modelPath)) {
+                    selectedModelPath = modelPath;
+                }
+            }
+        }
+        ImGui::EndChild();
+
+        ImGui::Spacing();
+        if (ImGui::Button("Add Selected Model to Script")) {
+            if (!selectedModelPath.empty()) {
+                int skins = SourceAssetManager::GetSkinCount(selectedModelPath);
+                // Inserting with a default chance of 10. Assumes fields: {chance, model, skin, ignorenormals}
+                uiVariations.push_back({ 10, selectedModelPath, (skins == 1 ? "0" : ""), "1" });
+            }
+        }
+
+        ImGui::SameLine();
+
+        // Selector to choose which script entry to override
+        ImGui::PushItemWidth(150);
+        ImGui::InputInt("Target Entry (Index)", &selectedVariationIndex);
+        ImGui::PopItemWidth();
+
+        ImGui::SameLine();
+
+        if (ImGui::Button("Modify Selected Script Entry") && selectedVariationIndex >= 0 && selectedVariationIndex < uiVariations.size()) {
+            if (!selectedModelPath.empty()) {
+                uiVariations[selectedVariationIndex].model = selectedModelPath;
+                int skins = SourceAssetManager::GetSkinCount(selectedModelPath);
+                uiVariations[selectedVariationIndex].skin = (skins == 1 ? "0" : "");
+            }
+        }
+        // ---------------------------------------------
+
+        ImGui::Spacing();
+
+        // 3. Save and Load Buttons (Native Windows Dialogs)
+
+        // If there are errors, disable the Save button!
+        if (hasErrors) {
+            ImGui::BeginDisabled();
+        }
+
+        if (ImGui::Button("Save As...", ImVec2(150, 40))) {
+            // Open Windows Save Dialog
+            auto destination = pfd::save_file("Save Sprinkle Script",
+                pfd::path::home() + pfd::path::separator() + "my_preset.txt",
+                { "Text Files", "*.txt", "All Files", "*" }).result();
+
+            // If the user didn't click "Cancel"
+            if (!destination.empty()) {
+                std::string outputText = SprinkleWriter::Generate(uiPresetName, uiClassname, uiGrid, uiVariations);
+                std::ofstream outFile(destination); // Save to the chosen path
+                if (outFile.is_open()) {
+                    outFile << outputText;
+                    outFile.close();
+                    statusMessage = "Success: File saved successfully!";
+                }
+                else {
+                    statusMessage = "Error: Could not save to the selected location.";
+                }
+            }
+        }
+
+        // If it was disabled, we must end the disabled state here so the next buttons still work
+        if (hasErrors) {
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), " Fix errors before saving!");
+        }
+        else {
+            ImGui::SameLine(); // Put the load button on the same line if there's no error text
+        }
+
+        if (ImGui::Button("Load File...", ImVec2(150, 40))) {
+            // Open Windows Open Dialog
+            auto selection = pfd::open_file("Open Sprinkle Script",
+                pfd::path::home(),
+                { "Text Files", "*.txt", "All Files", "*" },
+                pfd::opt::none).result();
+
+            // If the user selected a file
+            if (!selection.empty()) {
+                std::string filepath = selection[0]; // pfd returns a list, we just want the first file
+                bool success = SprinkleReader::Load(filepath, uiPresetName, uiClassname, uiGrid, uiVariations);
+                if (success) {
+                    statusMessage = "Success: File loaded successfully!";
+                }
+                else {
+                    statusMessage = "Error: Could not read the file format.";
+                }
+            }
+        }
+
+        // Show the status message below the buttons
+        ImGui::Spacing();
+        ImGui::Text("%s", statusMessage.c_str());
+
+        // ----------------------------------------------------
+        // 3D MODEL PREVIEW (embedded inside the main window)
+        // ----------------------------------------------------
+        if (!fboInitialized) {
+            previewFBO.Init(800 * kPreviewResolutionScale, 600 * kPreviewResolutionScale);
+            fboInitialized = true;
+        }
+
+        // --- RENDER PASS: Render 3D scene to FBO ---
+        previewFBO.Bind();
+        glViewport(0, 0, previewFBO.width, previewFBO.height);
+        glClearColor(0.15f, 0.15f, 0.18f, 1.0f); // Dark gray viewport background
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);
+
+        // --- PROJECTION MATRIX ---
+        // The GL context here is created without a "core profile" hint, so the
+        // legacy fixed-function pipeline (glMatrixMode/glFrustum/glBegin) is
+        // still available directly from opengl32.dll, no extra loader needed.
+        {
+            float aspect = (previewFBO.height > 0)
+                ? (float)previewFBO.width / (float)previewFBO.height
+                : 1.0f;
+            const float nearPlane = 1.0f;
+            const float farPlane = 5000.0f;
+            const float fovYDeg = 60.0f;
+            float top = nearPlane * tanf(fovYDeg * 0.5f * (3.14159265f / 180.0f));
+            float right = top * aspect;
+
+            glMatrixMode(GL_PROJECTION);
+            glLoadIdentity();
+            glFrustum(-right, right, -top, top, nearPlane, farPlane);
+
+            // --- VIEW (ORBIT CAMERA) MATRIX ---
+            glMatrixMode(GL_MODELVIEW);
+            glLoadIdentity();
+            glTranslatef(0.0f, 0.0f, -cameraDistance);
+            glRotatef(cameraPitch, 1.0f, 0.0f, 0.0f);
+            glRotatef(cameraYaw, 0.0f, 1.0f, 0.0f);
+        }
+
+        // --- MODEL RENDERING ---
+        // (Re)load the studio model (.mdl + .vtx + .vvd) whenever the selection
+        // changes, then draw the real baked mesh via mdlpp.
+        if (selectedModelPath != lastLoadedModelPath) {
+            lastLoadedModelPath = selectedModelPath;
+            if (selectedModelPath.empty()) {
+                previewModel.Clear();
+            }
+            else if (!previewModel.Load(selectedModelPath)) {
+                std::cerr << "[ModelPreview] " << previewModel.lastError << std::endl;
+            }
+        }
+
+        if (!selectedModelPath.empty()) {
+            // Ground grid
+            glColor3f(0.4f, 0.4f, 0.4f);
+            glBegin(GL_LINES);
+            const float gridSize = 100.0f;
+            const int gridLines = 10;
+            for (int i = -gridLines; i <= gridLines; ++i) {
+                float offset = i * (gridSize / gridLines);
+                glVertex3f(offset, 0.0f, -gridSize);
+                glVertex3f(offset, 0.0f, gridSize);
+                glVertex3f(-gridSize, 0.0f, offset);
+                glVertex3f(gridSize, 0.0f, offset);
+            }
+            glEnd();
+
+            if (previewModel.loaded) {
+                previewModel.Draw();
+            }
+            else {
+                // Fallback placeholder: mdlpp couldn't parse this model (or its
+                // .vtx/.vvd companions weren't found), so draw a wireframe cube
+                // instead of showing nothing.
+                const float s = 20.0f;
+                glColor3f(0.9f, 0.6f, 0.1f);
+                glBegin(GL_LINES);
+                float verts[8][3] = {
+                    { -s, 0.0f, -s }, { s, 0.0f, -s }, { s, 0.0f, s }, { -s, 0.0f, s },
+                    { -s, 2 * s, -s }, { s, 2 * s, -s }, { s, 2 * s, s }, { -s, 2 * s, s }
+                };
+                int edges[12][2] = {
+                    {0,1},{1,2},{2,3},{3,0},
+                    {4,5},{5,6},{6,7},{7,4},
+                    {0,4},{1,5},{2,6},{3,7}
+                };
+                for (auto& edge : edges) {
+                    glVertex3fv(verts[edge[0]]);
+                    glVertex3fv(verts[edge[1]]);
+                }
+                glEnd();
+            }
+        }
+
+        ViewportFBO::Unbind();
+
+        // --- IMGUI VIEWPORT (embedded child, not a floating window) ---
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "3D Model Preview");
+
+        if (ImGui::BeginChild("ModelPreviewRegion", ImVec2(0, 400), true)) {
+            // Get available region size inside the child
+            ImVec2 panelSize = ImGui::GetContentRegionAvail();
+            if (panelSize.x < 50) panelSize.x = 50;
+            if (panelSize.y < 50) panelSize.y = 50;
+
+            // Resize the FBO to a higher resolution than the displayed panel
+            // (supersampling) so the preview looks sharp even when scaled down.
+            previewFBO.Resize((int)(panelSize.x * kPreviewResolutionScale), (int)(panelSize.y * kPreviewResolutionScale));
+
+            // Display the FBO texture as an image inside the child window
+            ImGui::Image((void*)(intptr_t)previewFBO.textureColorBuffer, panelSize, ImVec2(0, 1), ImVec2(1, 0));
+
+            // Mouse interaction: click and drag inside the viewport to rotate camera
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                ImVec2 delta = ImGui::GetIO().MouseDelta;
+                cameraYaw += delta.x * 0.5f;
+                cameraPitch += delta.y * 0.5f;
+
+                // Clamp pitch to prevent camera flipping
+                if (cameraPitch > 89.0f) cameraPitch = 89.0f;
+                if (cameraPitch < -89.0f) cameraPitch = -89.0f;
+            }
+
+            // Zoom control via mouse wheel
+            if (ImGui::IsItemHovered()) {
+                float wheel = ImGui::GetIO().MouseWheel;
+                if (wheel != 0.0f) {
+                    cameraDistance -= wheel * 10.0f;
+                    cameraDistance = std::clamp(cameraDistance, 10.0f, 1000.0f);
+                }
+            }
+        }
+        ImGui::EndChild();
+
+        ImGui::End();
+        // --- END OF WINDOW DRAWING ---
+
+        // Render to screen 
+        ImGui::Render();
+        int display_w, display_h;
+        glfwGetFramebufferSize(window, &display_w, &display_h);
+        glViewport(0, 0, display_w, display_h);
+        glClearColor(0.15f, 0.15f, 0.15f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(window);
+    }
+
+    // Clean shutdown
+    previewFBO.Cleanup();
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    glfwDestroyWindow(window);
+    glfwTerminate();
+
     return 0;
 }
