@@ -32,12 +32,12 @@ public:
 
         // 3. Define the specific Source Engine games we want to look for
         // AppID 440: Team Fortress 2
-        // AppID 730: Counter-Strike 2 / CS:GO
         // AppID 240: Counter-Strike: Source
         // AppID 4000: Garry's Mod
+        // NOTE: Counter-Strike 2 (AppID 730) is intentionally excluded - it runs on
+        // Source 2, which the Sprinkle tool doesn't target (only CS:GO/Source 1 did).
         vector<SourceGame> targetGames = {
             {"Team Fortress 2", 440, ""},
-            {"Counter-Strike 2", 730, ""},
             {"Counter-Strike: Source", 240, ""},
             {"Garry's Mod", 4000, ""}
         };

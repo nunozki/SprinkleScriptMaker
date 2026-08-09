@@ -8,6 +8,7 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <map>
 #include "headers/SprinkleWriter.h"
 #include "headers/SprinkleReader.h"
 #include "headers/SteamDetector.h"
@@ -15,6 +16,8 @@
 #include "headers/ModelRenderer.h"
 #include <algorithm>
 #include <cmath>
+#include <thread>
+#include <atomic>
 
 using namespace std;
 
@@ -83,11 +86,23 @@ void test() {
 
 int main() {
     // Game Asset Indexer state variables
-    vector<std::string> indexedModels;
-    bool isIndexingAssets = false;
+    vector<string> indexedModels;
+    atomic<bool> isIndexingAssets{false};
+    atomic<bool> indexingResultReady{false};
+    vector<string> pendingIndexedModels;
+    thread indexingThread;
     string searchFilter = "";
     int lastSelectedGameIndex = -1;
     bool gameJustChanged = false; // Set when the selected game changes, so stale model selection can be cleared
+
+    // The model-path autocomplete popup used to scan the entire indexedModels list
+    // (tens of thousands of entries) with a substring search on EVERY frame while the
+    // input was active, which is the real cause of the perceived "slowness" - it's not
+    // the asset indexing (that's cached/fast), it's this per-frame UI filtering.
+    // Cache the filtered results per variation slot and only recompute when the typed
+    // text (or the underlying model list) actually changes.
+    map<size_t, string> suggestionCacheQuery;
+    map<size_t, vector<string>> suggestionCacheResults;
 
     // GLFW and ImGui initialization
     if (!glfwInit()) return -1;
@@ -188,11 +203,33 @@ int main() {
                 ImGui::EndCombo();
             }
 
-            // Trigger asset indexing if selected game changes or on initial boot
-            if (selectedGameIndex != lastSelectedGameIndex) {
+            // Trigger asset indexing if selected game changes or on initial boot.
+            // Runs on a background thread so the window shows/renders immediately instead
+            // of freezing for the whole (potentially slow) scan duration.
+            if (selectedGameIndex != lastSelectedGameIndex && !isIndexingAssets.load()) {
                 lastSelectedGameIndex = selectedGameIndex;
-                indexedModels = SourceAssetManager::IndexGameModels(detectedGames[selectedGameIndex].path);
                 gameJustChanged = true; // Model selection/preview state below belongs to the old game and must be reset
+
+                if (indexingThread.joinable()) indexingThread.join(); // Previous scan already finished by now
+
+                isIndexingAssets = true;
+                string gameRootPath = detectedGames[selectedGameIndex].path;
+                indexingThread = std::thread([gameRootPath, &pendingIndexedModels, &indexingResultReady, &isIndexingAssets]() {
+                    auto result = SourceAssetManager::IndexGameModels(gameRootPath);
+                    pendingIndexedModels = std::move(result);
+                    indexingResultReady = true;
+                    isIndexingAssets = false;
+                });
+            }
+
+            // Pick up the finished background scan's results, if any, without blocking.
+            if (indexingResultReady.load()) {
+                indexedModels = std::move(pendingIndexedModels);
+                indexingResultReady = false;
+            }
+
+            if (isIndexingAssets.load()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Indexing models...");
             }
 
             ImGui::TextDisabled("Path: %s | Indexed Models: %d",
@@ -237,28 +274,42 @@ int main() {
                 ImGui::SetNextWindowPos(ImVec2(ImGui::GetItemRectMin().x, ImGui::GetItemRectMax().y));
                 ImGui::SetNextWindowSize(ImVec2(ImGui::GetItemRectSize().x, 200));
 
-                if (ImGui::Begin("##ModelSuggestions", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize)) {
-                    int matches = 0;
+                // Scanning the whole indexedModels list (tens of thousands of entries after
+                // indexing a game like TF2) with a substring search on EVERY frame while the
+                // input is active is what actually made typing feel "super slow" - not the
+                // asset indexing itself. Only recompute the filtered matches when the typed
+                // text changes, and reuse the cached result otherwise.
+                auto cachedQueryIt = suggestionCacheQuery.find(i);
+                if (cachedQueryIt == suggestionCacheQuery.end() || cachedQueryIt->second != uiVariations[i].model) {
+                    vector<string> filtered;
                     for (const auto& mdl : indexedModels) {
                         if (mdl.find(uiVariations[i].model) != std::string::npos) {
+                            filtered.push_back(mdl);
+                            if (filtered.size() > 50) break;
+                        }
+                    }
+                    suggestionCacheQuery[i] = uiVariations[i].model;
+                    suggestionCacheResults[i] = std::move(filtered);
+                }
 
-                            if (ImGui::Selectable(mdl.c_str())) {
-                                uiVariations[i].model = mdl; // Fill input text
+                if (ImGui::Begin("##ModelSuggestions", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize)) {
+                    for (const auto& mdl : suggestionCacheResults[i]) {
+                        if (ImGui::Selectable(mdl.c_str())) {
+                            uiVariations[i].model = mdl; // Fill input text
+                            suggestionCacheQuery.erase(i); // Force refresh next time the popup opens
+                            suggestionCacheResults.erase(i);
 
-                                // --- NEW: AUTO-DETECT SKINS ---
-                                int skinCount = SourceAssetManager::GetSkinCount(mdl);
+                            // --- NEW: AUTO-DETECT SKINS ---
+                            int skinCount = SourceAssetManager::GetSkinCount(mdl);
 
-                                if (skinCount == 1) {
-                                    uiVariations[i].skin = "0"; // Only 1 skin exists, set to default
-                                }
-                                else if (skinCount > 1) {
-                                    // Let user know multiple exist by leaving blank or putting a hint
-                                    uiVariations[i].skin = "";
-                                }
-                                // ------------------------------
+                            if (skinCount == 1) {
+                                uiVariations[i].skin = "0"; // Only 1 skin exists, set to default
                             }
-                            matches++;
-                            if (matches > 50) break;
+                            else if (skinCount > 1) {
+                                // Let user know multiple exist by leaving blank or putting a hint
+                                uiVariations[i].skin = "";
+                            }
+                            // ------------------------------
                         }
                     }
                     ImGui::End();
@@ -304,18 +355,45 @@ int main() {
         }
 
         if (ImGui::BeginChild("ModelListRegion", ImVec2(0, 180), true, ImGuiWindowFlags_HorizontalScrollbar)) {
-            for (const auto& [modelPath, sourcePath] : SourceAssetManager::ModelLocations) {
-                if (strlen(searchBuffer) > 0) {
-                    if (modelPath.find(searchBuffer) == std::string::npos) {
+            // Snapshot copy so we don't race with the background indexing thread while it
+            // publishes a new index (e.g. right after switching games).
+            //
+            // This used to iterate ALL ~24000 indexed models EVERY FRAME and call
+            // GetSkinCount() for each one - which opens the entire VPK archive the first
+            // time a given model is seen. Doing that for thousands of models in a single
+            // frame is what caused the freeze right after indexing finished. Apply the
+            // text filter first (cheap string search) to build a small filtered list, then
+            // use ImGuiListClipper so only the handful of rows actually visible on screen
+            // ever call GetSkinCount() or get rendered.
+            static vector<std::pair<string, string>> filteredModelList;
+            static string lastSearchBuffer;
+            static size_t lastModelCount = SIZE_MAX;
+            size_t currentModelCount = indexedModels.size();
+            if (lastSearchBuffer != searchBuffer || lastModelCount != currentModelCount) {
+                lastSearchBuffer = searchBuffer;
+                lastModelCount = currentModelCount;
+                filteredModelList.clear();
+                for (const auto& [modelPath, sourcePath] : SourceAssetManager::GetModelLocationsSnapshot()) {
+                    if (strlen(searchBuffer) > 0 && modelPath.find(searchBuffer) == std::string::npos) {
                         continue;
                     }
+                    filteredModelList.emplace_back(modelPath, sourcePath);
                 }
+            }
 
-                int skinCount = SourceAssetManager::GetSkinCount(modelPath);
-                std::string label = modelPath + " (Skins: " + std::to_string(skinCount) + ")";
+            ImGuiListClipper clipper;
+            clipper.Begin((int)filteredModelList.size());
+            while (clipper.Step()) {
+                for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                    const auto& [modelPath, sourcePath] = filteredModelList[row];
+                    ImGui::PushID(row);
+                    int skinCount = SourceAssetManager::GetSkinCount(modelPath);
+                    std::string label = modelPath + " (Skins: " + std::to_string(skinCount) + ")";
 
-                if (ImGui::Selectable(label.c_str(), selectedModelPath == modelPath)) {
-                    selectedModelPath = modelPath;
+                    if (ImGui::Selectable(label.c_str(), selectedModelPath == modelPath)) {
+                        selectedModelPath = modelPath;
+                    }
+                    ImGui::PopID();
                 }
             }
         }
@@ -564,6 +642,10 @@ int main() {
     }
 
     // Clean shutdown
+    // Make sure the background indexing thread (if any) finishes before we tear down state
+    // it might still be writing to - joining an already-finished thread returns immediately.
+    if (indexingThread.joinable()) indexingThread.join();
+
     previewFBO.Cleanup();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
