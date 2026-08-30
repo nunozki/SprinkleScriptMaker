@@ -14,6 +14,7 @@
 #include <chrono>
 #include <thread>
 #include <future>
+#include <memory>
 
 // SourcePP VPK library header
 #include <vpkpp/vpkpp.h>
@@ -36,6 +37,14 @@ public:
     // don't re-open the same file or VPK entry over and over.
     static inline map<string, int> SkinCountCache;
 
+    // Cache of already-opened VPK archives, keyed by resolved archive path. Opening a VPK
+    // re-parses its whole directory index, which is expensive; without this cache, scrolling
+    // the model list into rows that share the same (large) VPK but haven't been queried yet
+    // reopens/re-parses that same archive once per model, causing the freeze reported when
+    // scrolling reaches previously-unseen rows.
+    static inline map<string, shared_ptr<vpkpp::PackFile>> OpenVpkCache;
+    static inline mutex OpenVpkMutex;
+
     // Guards ModelLocations/SkinCountCache, since IndexGameModels is meant to be run on a
     // background thread (so the UI thread never blocks/freezes while scanning a game's
     // assets) while the UI thread concurrently reads them (model list, skin counts, preview).
@@ -52,6 +61,23 @@ public:
         if (fs::exists(dirVariant)) return dirVariant;
 
         return vpkPath; // Not found either way; let the caller fail gracefully
+    }
+
+    // Returns a shared, cached handle to an already-open VPK archive, opening (and parsing)
+    // it only the first time a given archive path is requested.
+    static shared_ptr<vpkpp::PackFile> GetOrOpenVpk(const string& actualVpkPath) {
+        {
+            lock_guard<mutex> lock(OpenVpkMutex);
+            auto it = OpenVpkCache.find(actualVpkPath);
+            if (it != OpenVpkCache.end()) return it->second;
+        }
+
+        auto vpk = vpkpp::VPK::open(actualVpkPath);
+        shared_ptr<vpkpp::PackFile> shared = vpk ? shared_ptr<vpkpp::PackFile>(std::move(vpk)) : nullptr;
+
+        lock_guard<mutex> lock(OpenVpkMutex);
+        OpenVpkCache[actualVpkPath] = shared;
+        return shared;
     }
 
     // Safe to call from a background thread: only builds a local index and swaps it into
@@ -328,8 +354,9 @@ public:
         }
         if (sourcePath.ends_with(".vpk")) {
             try {
-                // Read directly from the VPK archive
-                auto vpk = vpkpp::VPK::open(ResolveActualVpkPath(sourcePath).string());
+                // Read directly from the VPK archive (reusing an already-open handle rather
+                // than reopening/re-parsing the whole archive for every model queried)
+                auto vpk = GetOrOpenVpk(ResolveActualVpkPath(sourcePath).string());
                 if (!vpk) return -1;
 
                 // FIX: vpkpp is smart! Just ask it to read the string path directly.
@@ -652,5 +679,8 @@ private:
         std::lock_guard<std::mutex> lock(IndexMutex);
         ModelLocations = std::move(localModelLocations);
         SkinCountCache.clear();
+
+        std::lock_guard<std::mutex> vpkLock(OpenVpkMutex);
+        OpenVpkCache.clear();
     }
 };
