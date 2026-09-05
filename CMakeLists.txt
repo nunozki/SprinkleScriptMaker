@@ -17,6 +17,7 @@ message(STATUS "Downloading SourcePP...")
 FetchContent_Declare(sourcepp GIT_REPOSITORY https://github.com/craftablescience/sourcepp.git GIT_TAG main)
 set(SOURCEPP_BUILD_VPKPP ON CACHE BOOL "" FORCE)
 set(SOURCEPP_USE_MDLPP ON CACHE BOOL "" FORCE)
+set(SOURCEPP_USE_VTFPP ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(sourcepp)
 
 message(STATUS "Downloading GLFW...")
@@ -53,7 +54,7 @@ add_executable(SprinkleScriptMaker
     ${IMGUI_SOURCES}
 )
 
-target_link_libraries(SprinkleScriptMaker PRIVATE sourcepp::vpkpp sourcepp::mdlpp glfw opengl32)
+target_link_libraries(SprinkleScriptMaker PRIVATE sourcepp::vpkpp sourcepp::mdlpp sourcepp::vtfpp sourcepp::kvpp glfw opengl32)
 
 target_include_directories(SprinkleScriptMaker PRIVATE 
     ${sourcepp_SOURCE_DIR}/include

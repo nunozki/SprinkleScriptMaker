@@ -33,6 +33,10 @@ public:
     // Dictionary to remember exactly which VPK or folder a model belongs to
     static inline map<string, string> ModelLocations;
 
+    // The search paths discovered from the last indexed game's gameinfo.txt. Reused for
+    // generic asset lookups (textures/materials) that aren't part of the model index.
+    static inline vector<SearchPath> GameSearchPaths;
+
     // Cache of skin counts per model path, so repeated lookups (e.g. per-frame UI rendering)
     // don't re-open the same file or VPK entry over and over.
     static inline map<string, int> SkinCountCache;
@@ -115,6 +119,10 @@ public:
         auto indexStartTime = std::chrono::steady_clock::now();
 
         vector<SearchPath> searchPaths = ParseGameInfo(gameinfoFile, gameRootPath, gameinfoFolder);
+        {
+            lock_guard<mutex> lock(IndexMutex);
+            GameSearchPaths = searchPaths;
+        }
 
         // Re-scanning every VPK/model folder from scratch
         // directory index) is by far the most expensive part of indexing, and the result
@@ -499,6 +507,72 @@ public:
 
         errorOut.clear();
         return true;
+    }
+
+    // Locates and reads the raw bytes of an arbitrary asset (e.g. a .vmt or .vtf material
+    // file) by its game-relative path (e.g. "materials/props/foo.vtf"), searching every
+    // known search path (loose folders and VPKs) discovered from the last-indexed game's
+    // gameinfo.txt. Unlike LoadStudioModelBytes this isn't backed by a pre-built index,
+    // since textures/materials aren't enumerated up front - so this walks the search
+    // paths at call time. Returns false (with a reason in errorOut) if not found anywhere.
+    static bool LoadAssetBytes(const string& relPath, vector<std::byte>& out, string& errorOut) {
+        vector<SearchPath> searchPaths;
+        {
+            lock_guard<mutex> lock(IndexMutex);
+            searchPaths = GameSearchPaths;
+        }
+
+        for (const auto& sp : searchPaths) {
+            if (sp.isWildcard) {
+                if (!fs::exists(sp.path) || !fs::is_directory(sp.path)) continue;
+                try {
+                    for (const auto& subEntry : fs::directory_iterator(sp.path, fs::directory_options::skip_permission_denied)) {
+                        fs::path subPath = subEntry.path();
+                        bool isVpk = subPath.extension() == ".vpk" && subPath.stem().string().ends_with("_dir");
+                        if (subEntry.is_directory()) {
+                            if (ReadFileBytes(subPath / relPath, out)) {
+                                errorOut.clear();
+                                return true;
+                            }
+                        }
+                        else if (isVpk) {
+                            auto vpk = GetOrOpenVpk(ResolveActualVpkPath(subPath).string());
+                            if (vpk) {
+                                auto data = vpk->readEntry(relPath);
+                                if (data.has_value()) {
+                                    out = std::move(*data);
+                                    errorOut.clear();
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (const std::exception&) {
+                    // Ignore and keep searching other search paths.
+                }
+            }
+            else if (sp.isVpk) {
+                auto vpk = GetOrOpenVpk(ResolveActualVpkPath(sp.path).string());
+                if (vpk) {
+                    auto data = vpk->readEntry(relPath);
+                    if (data.has_value()) {
+                        out = std::move(*data);
+                        errorOut.clear();
+                        return true;
+                    }
+                }
+            }
+            else {
+                if (ReadFileBytes(sp.path / relPath, out)) {
+                    errorOut.clear();
+                    return true;
+                }
+            }
+        }
+
+        errorOut = "Asset not found in any search path: " + relPath;
+        return false;
     }
 
 private:

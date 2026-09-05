@@ -10,8 +10,12 @@
 #include <string>
 #include <vector>
 #include <limits>
+#include <unordered_map>
+#include <iostream>
 
 #include <mdlpp/mdlpp.h>
+#include <vtfpp/VTF.h>
+#include <kvpp/KV1.h>
 
 #include "SourceAssetManager.h"
 
@@ -65,6 +69,14 @@ struct ModelRenderer {
 		bakedModel = mdlpp::BakedModel{};
 		studioModel = mdlpp::StudioModel{};
 		lastError.clear();
+
+		for (const auto& [materialIndex, texId] : materialTextures) {
+			if (texId != 0) {
+				GLuint id = texId;
+				glDeleteTextures(1, &id);
+			}
+		}
+		materialTextures.clear();
 	}
 
 	// Draws the currently loaded model centered at the origin.
@@ -73,7 +85,14 @@ struct ModelRenderer {
 		if (!loaded) return;
 
 		glPushMatrix();
-		glTranslatef(-centerX, -centerY, -centerZ);
+
+		// Source Engine models are authored Z-up; OpenGL's default camera/view setup in this
+		// project expects Y-up, so without this rotation every model renders "lying on its
+		// side". Rotating -90 degrees about X turns Z-up into Y-up (Z becomes -Y, Y becomes Z).
+		glRotatef(-90.0f, 1.0f, 0.0f, 0.0f);
+		// Deliberately NOT translating by -center here: the model is drawn in its own local
+		// space so its origin (0,0,0) lines up with the viewport/grid origin, matching where
+		// the model would sit in-game rather than being re-centered on its bounding box.
 
 		glEnable(GL_LIGHTING);
 		glEnable(GL_LIGHT0);
@@ -86,18 +105,29 @@ struct ModelRenderer {
 		GLfloat ambient[4] = { 0.25f, 0.25f, 0.25f, 1.0f };
 		glLightfv(GL_LIGHT0, GL_AMBIENT, ambient);
 
-		glColor3f(0.8f, 0.8f, 0.8f); // neutral gray, since materials/textures aren't loaded yet
+		glColor3f(1.0f, 1.0f, 1.0f);
 
 		for (const auto& mesh : bakedModel.meshes) {
+			GLuint texId = GetOrLoadMaterialTexture(mesh.materialIndex);
+			if (texId != 0) {
+				glEnable(GL_TEXTURE_2D);
+				glBindTexture(GL_TEXTURE_2D, texId);
+			}
+			else {
+				glDisable(GL_TEXTURE_2D);
+			}
+
 			glBegin(GL_TRIANGLES);
 			for (uint16_t index : mesh.indices) {
 				const auto& vert = bakedModel.vertices[index];
 				glNormal3fv(vert.normal.data());
+				glTexCoord2f(vert.uv[0], vert.uv[1]);
 				glVertex3fv(vert.position.data());
 			}
 			glEnd();
 		}
 
+		glDisable(GL_TEXTURE_2D);
 		glDisable(GL_LIGHTING);
 		glDisable(GL_COLOR_MATERIAL);
 
@@ -105,6 +135,106 @@ struct ModelRenderer {
 	}
 
 private:
+	// Resolves (and caches) the GL texture for a baked mesh's material index, by locating
+	// the material's .vmt (to find $basetexture), then loading that .vtf and uploading its
+	// RGBA8888 pixel data as a GL_TEXTURE_2D. Returns 0 if no texture could be resolved.
+	GLuint GetOrLoadMaterialTexture(int32_t materialIndex) const {
+		if (materialIndex < 0 || static_cast<size_t>(materialIndex) >= studioModel.mdl.materials.size()) {
+			return 0;
+		}
+
+		auto cached = materialTextures.find(materialIndex);
+		if (cached != materialTextures.end()) return cached->second;
+
+		GLuint texId = LoadMaterialTextureFromDisk(materialIndex);
+		materialTextures[materialIndex] = texId;
+		return texId;
+	}
+
+	GLuint LoadMaterialTextureFromDisk(int32_t materialIndex) const {
+		const std::string& materialName = studioModel.mdl.materials[materialIndex].name;
+		const auto& materialDirs = studioModel.mdl.materialDirectories;
+
+		std::vector<std::string> dirsToTry = materialDirs;
+		if (dirsToTry.empty()) dirsToTry.push_back("");
+
+		bool foundAnyVmt = false;
+		for (auto dir : dirsToTry) {
+			if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') dir += '/';
+			for (auto& c : dir) if (c == '\\') c = '/';
+
+			std::string vmtPath = "materials/" + dir + materialName + ".vmt";
+
+			std::vector<std::byte> vmtBytes;
+			std::string err;
+			if (!SourceAssetManager::LoadAssetBytes(vmtPath, vmtBytes, err)) {
+				std::cerr << "[ModelRenderer] VMT not found: " << vmtPath << " (" << err << ")\n";
+				continue;
+			}
+			foundAnyVmt = true;
+
+			std::string vmtText(reinterpret_cast<const char*>(vmtBytes.data()), vmtBytes.size());
+			try {
+				kvpp::KV1 kv{vmtText};
+				std::string baseTexture;
+				for (const char* key : {"$basetexture", "$baseTexture", "$BaseTexture"}) {
+					if (kv.hasChild(key)) {
+						baseTexture = std::string(kv[key].getValue());
+						break;
+					}
+				}
+				if (baseTexture.empty()) {
+					std::cerr << "[ModelRenderer] VMT has no $basetexture: " << vmtPath << "\n";
+					continue;
+				}
+
+				for (auto& c : baseTexture) if (c == '\\') c = '/';
+				std::string vtfPath = "materials/" + baseTexture + ".vtf";
+
+				std::vector<std::byte> vtfBytes;
+				if (!SourceAssetManager::LoadAssetBytes(vtfPath, vtfBytes, err)) {
+					std::cerr << "[ModelRenderer] VTF not found: " << vtfPath << " (" << err << ")\n";
+					continue;
+				}
+
+				vtfpp::VTF vtf{std::move(vtfBytes)};
+				if (!vtf) {
+					std::cerr << "[ModelRenderer] vtfpp failed to parse VTF: " << vtfPath << "\n";
+					continue;
+				}
+
+				uint16_t width = vtf.getWidth();
+				uint16_t height = vtf.getHeight();
+				std::vector<std::byte> rgba = vtf.getImageDataAsRGBA8888();
+				if (rgba.empty() || width == 0 || height == 0) {
+					std::cerr << "[ModelRenderer] VTF decoded but produced no pixel data: " << vtfPath << "\n";
+					continue;
+				}
+
+				GLuint texId;
+				glGenTextures(1, &texId);
+				glBindTexture(GL_TEXTURE_2D, texId);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+				glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+				glBindTexture(GL_TEXTURE_2D, 0);
+				std::cerr << "[ModelRenderer] Loaded texture " << vtfPath << " (" << width << "x" << height << ") for material \"" << materialName << "\"\n";
+				return texId;
+			}
+			catch (const std::exception& e) {
+				std::cerr << "[ModelRenderer] Exception parsing VMT " << vmtPath << ": " << e.what() << "\n";
+				continue;
+			}
+		}
+
+		if (!foundAnyVmt) {
+			std::cerr << "[ModelRenderer] Could not find any .vmt for material \"" << materialName << "\" (tried " << dirsToTry.size() << " material director" << (dirsToTry.size() == 1 ? "y" : "ies") << ")\n";
+		}
+
+		return 0;
+	}
 	void ComputeBounds() {
 		float minX = std::numeric_limits<float>::max(), minY = minX, minZ = minX;
 		float maxX = std::numeric_limits<float>::lowest(), maxY = maxX, maxZ = maxX;
@@ -124,4 +254,6 @@ private:
 		boundingRadius = 0.5f * std::sqrt(dx * dx + dy * dy + dz * dz);
 		if (boundingRadius <= 0.0f) boundingRadius = 1.0f;
 	}
+
+	mutable std::unordered_map<int32_t, GLuint> materialTextures;
 };
