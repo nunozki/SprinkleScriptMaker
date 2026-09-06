@@ -1,0 +1,45 @@
+diff --git a/src/mdlpp/structs/VTX.cpp b/src/mdlpp/structs/VTX.cpp
+index 414590b..b40989e 100644
+--- a/src/mdlpp/structs/VTX.cpp
++++ b/src/mdlpp/structs/VTX.cpp
+@@ -162,12 +162,25 @@ bool VTX::open(const std::byte* data, std::size_t size, const MDL::MDL& mdl, Has
+ 								const auto indicesCount = stream.read<int32_t>();
+ 								stream.read(strip.indicesOffset);
+ 								// Note: offset is in elements, not bytes
+-								strip.indices = std::span(stripGroup.indices.begin() + strip.indicesOffset, indicesCount);
++								// SprinkleScriptMaker patch: some .vtx assets carry out-of-range
++								// offset/count fields (corrupt file, wrong dx-level variant, or
++								// mismatch with the paired .mdl). Constructing a span past the end
++								// of the vector trips a fatal, non-catchable STATUS_INVALID_PARAMETER
++								// (0xC0000409) in debug CRT builds. Skip the span (leave it empty)
++								// instead of crashing.
++								if (strip.indicesOffset >= 0 && indicesCount >= 0 &&
++									static_cast<std::size_t>(strip.indicesOffset) + static_cast<std::size_t>(indicesCount) <= stripGroup.indices.size()) {
++									strip.indices = std::span(stripGroup.indices.begin() + strip.indicesOffset, indicesCount);
++								}
+ 
+ 								const auto verticesCount = stream.read<int32_t>();
+ 								stream.read(strip.verticesOffset);
+ 								// Note: offset is in elements, not bytes
+-								strip.vertices = std::span(stripGroup.vertices.begin() + strip.verticesOffset, verticesCount);
++								// SprinkleScriptMaker patch: see note above.
++								if (strip.verticesOffset >= 0 && verticesCount >= 0 &&
++									static_cast<std::size_t>(strip.verticesOffset) + static_cast<std::size_t>(verticesCount) <= stripGroup.vertices.size()) {
++									strip.vertices = std::span(stripGroup.vertices.begin() + strip.verticesOffset, verticesCount);
++								}
+ 
+ 								stream
+ 									.read(strip.boneCount)
+@@ -197,7 +210,11 @@ bool VTX::open(const std::byte* data, std::size_t size, const MDL::MDL& mdl, Has
+ 									const auto topologyIndicesCount = stream.read<int32_t>();
+ 									stream.read(strip.topologyIndicesOffset);
+ 									// Note: offset is in elements, not bytes
+-									strip.topologyIndices = std::span(stripGroup.topologyIndices.begin() + strip.topologyIndicesOffset, topologyIndicesCount);
++									// SprinkleScriptMaker patch: see note above.
++									if (strip.topologyIndicesOffset >= 0 && topologyIndicesCount >= 0 &&
++										static_cast<std::size_t>(strip.topologyIndicesOffset) + static_cast<std::size_t>(topologyIndicesCount) <= stripGroup.topologyIndices.size()) {
++										strip.topologyIndices = std::span(stripGroup.topologyIndices.begin() + strip.topologyIndicesOffset, topologyIndicesCount);
++									}
+ 								}
+ 							}
+ 						}

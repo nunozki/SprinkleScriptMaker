@@ -14,7 +14,38 @@ set(MZ_ZSTD OFF CACHE BOOL "Disable zstd" FORCE)
 include(FetchContent)
 
 message(STATUS "Downloading SourcePP...")
-FetchContent_Declare(sourcepp GIT_REPOSITORY https://github.com/craftablescience/sourcepp.git GIT_TAG main)
+# NOTE: sourcepp's mdlpp VTX parser (src/mdlpp/structs/VTX.cpp) trusts offset/count
+# fields read directly from .vtx files when constructing std::span objects over
+# internal vectors. A malformed or mismatched .vtx (wrong dx-level variant, stale
+# file colliding inside a VPK, truncated/corrupt data, etc.) can cause those spans
+# to be built past the end of the underlying vector, which trips a fatal, *non-
+# catchable* STATUS_INVALID_PARAMETER (0xC0000409) fail-fast in debug CRT builds -
+# __try/__except cannot intercept it. Since we don't maintain a fork, apply a small
+# local patch (adds bounds checks around the offending spans) right after the
+# source is fetched, so every configure gets the fix regardless of GIT_TAG updates.
+# See patches/README.md, patches/sourcepp-vtx-bounds-check.patch, and
+# src/headers/ModelRenderer.h.
+#
+# GIT_TAG is pinned to a specific commit (rather than floating "main") precisely so
+# this patch's line-context stays valid; bumping the pin requires re-validating
+# (and likely refreshing) the patch against the new upstream code.
+#
+# apply-sourcepp-patches.cmake skips (re-)applying if the patch is already present
+# in the fetched source (idempotent across repeated configures reusing the same
+# _deps checkout), but fails the configure loudly if the patch can't be applied at
+# all - so a version-drift/context-mismatch can never silently ship the
+# unpatched, crash-prone parser code.
+find_package(Git REQUIRED)
+FetchContent_Declare(sourcepp
+    GIT_REPOSITORY https://github.com/craftablescience/sourcepp.git
+    GIT_TAG main # TODO: pin to a known-good commit hash once one is chosen/verified
+    PATCH_COMMAND ${CMAKE_COMMAND}
+        -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
+        -DSOURCE_DIR=<SOURCE_DIR>
+        -DPATCH_FILE=${CMAKE_SOURCE_DIR}/patches/sourcepp-vtx-bounds-check.patch
+        -P ${CMAKE_SOURCE_DIR}/patches/apply-sourcepp-patches.cmake
+    UPDATE_DISCONNECTED TRUE
+)
 set(SOURCEPP_BUILD_VPKPP ON CACHE BOOL "" FORCE)
 set(SOURCEPP_USE_MDLPP ON CACHE BOOL "" FORCE)
 set(SOURCEPP_USE_VTFPP ON CACHE BOOL "" FORCE)

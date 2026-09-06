@@ -23,6 +23,53 @@
 
 #include "SourceAssetManager.h"
 
+#if defined(_WIN32)
+#include <Windows.h>
+#endif
+
+// mdlpp::VTX::open() (invoked transitively by mdlpp::StudioModel::open()) trusts
+// offset/count fields read directly from the .vtx file to build std::span objects
+// over internal vectors (see sourcepp's VTX.cpp). If a .vtx doesn't actually match
+// its paired .mdl (wrong dx-level variant, stale/leftover file with a colliding
+// name inside a VPK, truncated/corrupt data, etc.), those offsets used to be able
+// to point past the end of the underlying vector, tripping
+// _STL_VERIFY("cannot seek vector iterator after end").
+//
+// IMPORTANT: that particular failure raises a fatal STATUS_INVALID_PARAMETER
+// (0xC0000409) via the CRT's invalid parameter handler / __fastfail. This is a
+// fail-fast, NOT a structured exception - __try/__except cannot intercept it
+// under any circumstances (this is by design, to prevent exploitation of memory
+// corruption bugs). The real fix for that specific crash is
+// patches/sourcepp-vtx-bounds-check.patch, applied automatically to the vendored
+// sourcepp source by CMakeLists.txt (see PATCH_COMMAND on the sourcepp
+// FetchContent_Declare); that patch adds the missing bounds checks directly in
+// VTX.cpp so those spans are simply left empty instead of trapping.
+//
+// The SEH wrapper below is kept as defense-in-depth for *other*, genuinely
+// catchable native faults (e.g. access violations) that could still occur
+// elsewhere in mdlpp while parsing a corrupt/adversarial asset, so a single bad
+// model load fails gracefully (reported via lastError) instead of taking down
+// the app - but it must not be relied upon for 0xC0000409-class failures. This
+// must stay in its own function: objects with non-trivial destructors are not
+// allowed in a function that contains __try/__except.
+static bool SafeOpenStudioModel(mdlpp::StudioModel& model,
+								 const std::vector<std::byte>& mdlBytes,
+								 const std::vector<std::byte>& vtxBytes,
+								 const std::vector<std::byte>& vvdBytes,
+								 bool& outFaultTrapped) {
+	outFaultTrapped = false;
+#if defined(_WIN32)
+	__try {
+		return model.open(mdlBytes, vtxBytes, vvdBytes);
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		outFaultTrapped = true;
+		return false;
+	}
+#else
+	return model.open(mdlBytes, vtxBytes, vvdBytes);
+#endif
+}
+
 // Holds everything about a resolved material that affects how it's drawn:
 // not just the base texture, but the handful of $params that commonly show
 // up in VMTs and change render state (transparency, additive blending,
@@ -48,12 +95,34 @@ struct ModelRenderer {
 	float centerX = 0.0f, centerY = 0.0f, centerZ = 0.0f;
 	float boundingRadius = 1.0f;
 
+	// Which skin family (mdl.skins row) is currently applied to the preview. Skin 0 is
+	// always the model's default/authored skin.
+	int currentSkin = 0;
+
+	// Number of selectable skin families the loaded model exposes (0 if none/unloaded).
+	int GetSkinCount() const {
+		return static_cast<int>(studioModel.mdl.skins.size());
+	}
+
+	// Selects which skin family to render. Values outside the valid range are clamped.
+	void SetSkin(int skin) {
+		int count = GetSkinCount();
+		if (count <= 0) {
+			currentSkin = 0;
+			return;
+		}
+		if (skin < 0) skin = 0;
+		if (skin >= count) skin = count - 1;
+		currentSkin = skin;
+	}
+
 	// Loads and bakes a model by its indexed path (e.g. "models/props/foo.mdl").
 	// Returns true on success; on failure, lastError explains why and any
 	// previously loaded model is cleared.
 	bool Load(const std::string& modelPath) {
 		loaded = false;
 		bakedModel = mdlpp::BakedModel{};
+		currentSkin = 0;
 
 		// mdlpp::StudioModel::open() refuses to run again once it has already
 		// been opened once (its internal `opened` flag latches to true), so a
@@ -71,8 +140,17 @@ struct ModelRenderer {
 			return false;
 		}
 
-		if (!studioModel.open(mdlBytes, vtxBytes, vvdBytes)) {
-			lastError = "mdlpp failed to parse the model (corrupt or unsupported version): " + modelPath;
+		bool sehFaultTrapped = false;
+		if (!SafeOpenStudioModel(studioModel, mdlBytes, vtxBytes, vvdBytes, sehFaultTrapped)) {
+			if (sehFaultTrapped) {
+				// A native fault was trapped instead of crashing the process (see the
+				// SafeOpenStudioModel comment above - this covers catchable faults only;
+				// the out-of-range VTX topology-index span issue is fixed at the source
+				// via patches/sourcepp-vtx-bounds-check.patch, not by this SEH wrapper).
+				std::cerr << "[ModelRenderer] Native fault trapped while parsing model: "
+						  << modelPath << std::endl;
+			}
+			lastError = "mdlpp failed to parse the model (corrupt, mismatched, or unsupported MDL/VTX/VVD pair): " + modelPath;
 			return false;
 		}
 
@@ -93,6 +171,7 @@ struct ModelRenderer {
 		bakedModel = mdlpp::BakedModel{};
 		studioModel = mdlpp::StudioModel{};
 		lastError.clear();
+		currentSkin = 0;
 
 		ReleaseTextures();
 	}
@@ -139,7 +218,17 @@ public:
 		glColor3f(1.0f, 1.0f, 1.0f);
 
 		for (const auto& mesh : bakedModel.meshes) {
-			const MaterialGpuData& matData = GetOrLoadMaterialData(mesh.materialIndex);
+			// Skin families remap a mesh's default material index to an alternate one; the
+			// remap table (mdl.skins[currentSkin]) is indexed by the mesh's original/default
+			// material index, same as the engine's own pSkinref() lookup.
+			int32_t materialIndex = mesh.materialIndex;
+			if (currentSkin > 0 && static_cast<size_t>(currentSkin) < studioModel.mdl.skins.size()) {
+				const auto& skinTable = studioModel.mdl.skins[currentSkin];
+				if (materialIndex >= 0 && static_cast<size_t>(materialIndex) < skinTable.size()) {
+					materialIndex = skinTable[materialIndex];
+				}
+			}
+			const MaterialGpuData& matData = GetOrLoadMaterialData(materialIndex);
 			if (matData.textureId != 0) {
 				glEnable(GL_TEXTURE_2D);
 				glBindTexture(GL_TEXTURE_2D, matData.textureId);

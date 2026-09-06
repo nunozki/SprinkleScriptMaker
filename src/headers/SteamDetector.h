@@ -34,12 +34,42 @@ public:
         // AppID 440: Team Fortress 2
         // AppID 240: Counter-Strike: Source
         // AppID 4000: Garry's Mod
-        // NOTE: Counter-Strike 2 (AppID 730) is intentionally excluded - it runs on
-        // Source 2, which the Sprinkle tool doesn't target (only CS:GO/Source 1 did).
+        // AppID 630: Alien Swarm
+        // AppID 563560: Alien Swarm: Reactive Drop
+        // AppID 243730: Source SDK Base 2013 Singleplayer
+        // AppID 243750: Source SDK Base 2013 Multiplayer
+        // AppID 300: Day of Defeat: Source
+        // AppID 550: Left 4 Dead 2
+        // AppID 620: Portal 2
+        // AppID 220: Half-Life 2
+        // AppID 380: Half-Life 2: Episode One
+        // AppID 420: Half-Life 2: Episode Two
+        // AppID 730: Counter-Strike: Global Offensive
+        // NOTE: AppID 730 was upgraded in-place by Valve to Counter-Strike 2 (Source 2)
+        // for most players, but some installs (e.g. via depot downgrade tools, or backups
+        // that never got the CS2 update) can still be legacy Source 1 CS:GO. Since both
+        // share the same AppID/manifest, we can't tell them apart from the manifest alone -
+        // instead we only accept this as a Source 1 game if "csgo.exe" still exists directly
+        // in the install folder (CS2's own folder no longer ships that binary).
+        // AppID 4465480: a second, separate CS:GO install (e.g. a manually depot-downgraded
+        // copy kept side-by-side with the regular 730 install). When both are installed at
+        // once, their display names get tagged below so the user can tell which is which.
         vector<SourceGame> targetGames = {
             {"Team Fortress 2", 440, ""},
             {"Counter-Strike: Source", 240, ""},
-            {"Garry's Mod", 4000, ""}
+            {"Garry's Mod", 4000, ""},
+            {"Alien Swarm", 630, ""},
+            {"Alien Swarm: Reactive Drop", 563560, ""},
+            {"Source SDK Base 2013 Singleplayer", 243730, ""},
+            {"Source SDK Base 2013 Multiplayer", 243750, ""},
+            {"Day of Defeat: Source", 300, ""},
+            {"Left 4 Dead 2", 550, ""},
+            {"Portal 2", 620, ""},
+            {"Half-Life 2", 220, ""},
+            {"Half-Life 2: Episode One", 380, ""},
+            {"Half-Life 2: Episode Two", 420, ""},
+            {"Counter-Strike: Global Offensive", 730, ""},
+            {"Counter-Strike: Global Offensive", 4465480, ""}
         };
 
         // 4. Check each library for the specific game manifests
@@ -60,6 +90,17 @@ public:
                     // Build the path to the actual game directory (e.g., steamapps/common/GarrysMod)
                     foundGame.path = (filesystem::path(lib) / "steamapps" / "common" / installDir).string();
 
+                    // AppID 730 is shared between legacy Source 1 CS:GO and modern
+                    // Source 2 CS2 - the manifest alone can't tell them apart. Only
+                    // accept this install as (Source 1) CS:GO if "csgo.exe" still
+                    // exists directly in the game folder; CS2 no longer ships it.
+                    if (game.appId == 730) {
+                        filesystem::path csgoExe = filesystem::path(foundGame.path) / "csgo.exe";
+                        if (!filesystem::exists(csgoExe)) {
+                            continue; // This is CS2 (Source 2), not Source 1 CS:GO - skip it
+                        }
+                    }
+
                     // Prevent duplicates just in case
                     bool alreadyAdded = false;
                     for (const auto& ig : installedGames) {
@@ -72,6 +113,22 @@ public:
                 }
             }
         }
+
+        // If both CS:GO installs (the original AppID 730 and the second, separately
+        // downgraded/kept AppID 4465480) are present at once, tag each one's display
+        // name so the user can tell them apart in the target game list.
+        bool hasCsgo730 = false, hasCsgo4465480 = false;
+        for (const auto& g : installedGames) {
+            if (g.appId == 730) hasCsgo730 = true;
+            if (g.appId == 4465480) hasCsgo4465480 = true;
+        }
+        if (hasCsgo730 && hasCsgo4465480) {
+            for (auto& g : installedGames) {
+                if (g.appId == 730) g.name += " (Original - AppID 730)";
+                else if (g.appId == 4465480) g.name += " (New - AppID 4465480)";
+            }
+        }
+
         return installedGames;
     }
 

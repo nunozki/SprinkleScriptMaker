@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 #include <iostream>
+#include <iomanip>
 #include <algorithm>
 #include <cctype>
 #include <cstring> 
@@ -15,6 +16,7 @@
 #include <thread>
 #include <future>
 #include <memory>
+#include <atomic>
 
 // SourcePP VPK library header
 #include <vpkpp/vpkpp.h>
@@ -54,6 +56,13 @@ public:
     // assets) while the UI thread concurrently reads them (model list, skin counts, preview).
     static inline mutex IndexMutex;
 
+    // Bumped by the UI thread every time the selected game changes. IndexGameModels()
+    // captures the value in effect when it started and checks it periodically (between
+    // scan tasks); if it no longer matches, an indexing run for a since-abandoned game is
+    // in flight and should stop touching shared state / doing further work instead of
+    // racing with (and potentially clobbering) the newer game's own indexing run.
+    static inline atomic<uint64_t> IndexGeneration{0};
+
     // gameinfo.txt often references a VPK by its "logical" name (e.g. "garrysmod.vpk"),
     // while on disk the actual multi-chunk archive is named "<name>_dir.vpk" (with the
     // data itself split into "<name>_000.vpk", etc). The Source engine transparently
@@ -87,14 +96,24 @@ public:
     // Safe to call from a background thread: only builds a local index and swaps it into
     // the shared ModelLocations/SkinCountCache under a lock at the very end, so the UI
     // thread is never blocked for the whole (potentially slow) duration of the scan.
-    static vector<string> IndexGameModels(const string& gameRootPath) {
+    //
+    // myGeneration should be the value of IndexGeneration captured by the caller right
+    // before bumping it and starting this run (see main.cpp). If IndexGeneration no
+    // longer matches myGeneration by the time we'd otherwise do meaningful work, the
+    // selected game has changed again since this run started - bail out immediately
+    // without touching shared state or doing further scanning, so an old game's scan
+    // never overwrites the results of a newer one.
+    static vector<string> IndexGameModels(const string& gameRootPath, uint64_t myGeneration) {
         map<string, string> localModelLocations; // Built up locally, published atomically at the end
+
+        auto isStale = [&]() { return IndexGeneration.load() != myGeneration; };
 
         fs::path gameinfoFolder;
         fs::path gameinfoFile;
 
         try {
             for (const auto& entry : fs::directory_iterator(gameRootPath, fs::directory_options::skip_permission_denied)) {
+                if (isStale()) return {};
                 if (entry.is_directory()) {
                     fs::path target = entry.path() / "gameinfo.txt";
                     if (fs::exists(target)) {
@@ -107,9 +126,11 @@ public:
         }
         catch (const std::exception& e) {
             cerr << "[AssetManager] Error locating gameinfo.txt in " << gameRootPath << ": " << e.what() << '\n';
-            PublishIndex(localModelLocations);
+            if (!isStale()) PublishIndex(localModelLocations);
             return {};
         }
+
+        if (isStale()) return {};
 
         if (gameinfoFile.empty()) {
             PublishIndex(localModelLocations);
@@ -119,6 +140,16 @@ public:
         auto indexStartTime = std::chrono::steady_clock::now();
 
         vector<SearchPath> searchPaths = ParseGameInfo(gameinfoFile, gameRootPath, gameinfoFolder);
+
+        // Garry's Mod-specific extra sources: workshop/legacy addons (which aren't listed
+        // in gameinfo.txt at all - the engine mounts them dynamically at runtime) and any
+        // external Source Engine game paths mounted via cfg/mount.cfg. Both can contain
+        // models that would otherwise never show up in the model list.
+        AppendGModAddonSearchPaths(gameRootPath, searchPaths);
+        AppendGModMountCfgSearchPaths(gameRootPath, searchPaths);
+
+        if (isStale()) return {};
+
         {
             lock_guard<mutex> lock(IndexMutex);
             GameSearchPaths = searchPaths;
@@ -130,9 +161,10 @@ public:
         // keyed by gameRootPath and validated against the search paths' last-write times;
         // this turns every re-selection of an already-indexed game into a near-instant load.
         fs::path cacheFile = GetIndexCachePath(gameRootPath);
-        uint64_t fingerprint = ComputeSearchPathsFingerprint(gameinfoFile, searchPaths);
+        uint64_t fingerprint = ComputeSearchPathsFingerprint(gameinfoFile, searchPaths, gameRootPath);
 
         if (LoadIndexCache(cacheFile, fingerprint, localModelLocations)) {
+            if (isStale()) return {};
             vector<string> cachedKeys;
             cachedKeys.reserve(localModelLocations.size());
             for (const auto& [mdl, path] : localModelLocations) {
@@ -214,6 +246,7 @@ public:
 
         auto worker = [&]() {
             while (true) {
+                if (isStale()) return; // Selected game changed again; abandon remaining tasks for this stale run
                 size_t myIndex;
                 {
                     std::lock_guard<std::mutex> lock(taskMutex);
@@ -245,8 +278,16 @@ public:
         }
         for (auto& w : workers) w.join();
 
+        if (isStale()) {
+            // A newer game was selected while this run was still scanning; discard our
+            // (possibly incomplete) results instead of caching/publishing them, so we
+            // don't pollute the disk cache or clobber the newer run's in-progress state.
+            return {};
+        }
+
         auto scanElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - indexStartTime).count();
         cerr << "[AssetManager][Timing] All scan tasks finished in " << scanElapsedMs << " ms\n";
+
 
         // Return just the model paths for the UI
         vector<string> keys;
@@ -278,7 +319,7 @@ public:
     // own last-write time, plus each resolved search path's last-write time (VPK archives
     // and model directories alike). Any mod update, VPK repack, or new addon touches at
     // least one of these, so the cache stays correct without hashing file contents.
-    static uint64_t ComputeSearchPathsFingerprint(const fs::path& gameinfoFile, const vector<SearchPath>& searchPaths) {
+    static uint64_t ComputeSearchPathsFingerprint(const fs::path& gameinfoFile, const vector<SearchPath>& searchPaths, const fs::path& gameRootPath = {}) {
         uint64_t fp = 1469598103934665603ULL; // FNV offset basis
         auto mix = [&fp](uint64_t value) {
             fp ^= value;
@@ -294,10 +335,30 @@ public:
         };
 
         mixTime(gameinfoFile);
+        // Also cover GMod's mount.cfg and addons folder itself, so editing mount.cfg or
+        // adding/removing an addon folder invalidates the cache even if none of the
+        // resolved search paths' own timestamps happen to change.
+        if (!gameRootPath.empty()) {
+            mixTime(gameRootPath / "garrysmod" / "cfg" / "mount.cfg");
+            mixTime(gameRootPath / "garrysmod" / "addons");
+        }
         for (const auto& sp : searchPaths) {
             mixTime(sp.path);
             fs::path vpkCompanion = sp.path.parent_path() / (sp.path.filename().string() + "_dir.vpk");
             mixTime(vpkCompanion);
+            // Cover every "*_dir.vpk" archive shipped directly inside the mod folder
+            // itself (pak01_dir.vpk, pak02_dir.vpk, or any other naming some games use,
+            // e.g. Alien Swarm: Reactive Drop), not just a fixed "pakNN" scheme.
+            if (fs::exists(sp.path) && fs::is_directory(sp.path)) {
+                std::error_code dirEc;
+                for (const auto& entry : fs::directory_iterator(sp.path, fs::directory_options::skip_permission_denied, dirEc)) {
+                    if (!entry.is_regular_file()) continue;
+                    const fs::path& candidate = entry.path();
+                    if (candidate.extension() == ".vpk" && candidate.stem().string().ends_with("_dir")) {
+                        mixTime(candidate);
+                    }
+                }
+            }
         }
         return fp;
     }
@@ -568,6 +629,52 @@ public:
                     errorOut.clear();
                     return true;
                 }
+
+                // Mirrors ScanDirectoryForModels(): plain-folder search paths (e.g.
+                // "garrysmod") are often implicitly backed by a sibling
+                // "<foldername>_dir.vpk" that gameinfo.txt never mentions explicitly.
+                // Models found there are correctly indexed via ModelLocations (which
+                // stores the VPK path directly), but without this same fallback here,
+                // every material/texture lookup for those models would fail even
+                // though the .vmt/.vtf physically lives inside that VPK.
+                fs::path vpkCompanion = sp.path.parent_path() / (sp.path.filename().string() + "_dir.vpk");
+                if (fs::exists(vpkCompanion)) {
+                    auto vpk = GetOrOpenVpk(vpkCompanion.string());
+                    if (vpk) {
+                        auto data = vpk->readEntry(relPath);
+                        if (data.has_value()) {
+                            out = std::move(*data);
+                            errorOut.clear();
+                            return true;
+                        }
+                    }
+                }
+
+                // Newer Source games (Portal 2, L4D2, CS:GO, Alien Swarm, etc.) instead
+                // pack their base content INSIDE the mod folder itself as one or more
+                // "*_dir.vpk" archives (e.g. "portal2/pak01_dir.vpk"). Check those too.
+                if (fs::exists(sp.path) && fs::is_directory(sp.path)) {
+                    try {
+                        for (const auto& subEntry : fs::directory_iterator(sp.path, fs::directory_options::skip_permission_denied)) {
+                            if (!subEntry.is_regular_file()) continue;
+                            const fs::path& candidate = subEntry.path();
+                            if (candidate.extension() == ".vpk" && candidate.stem().string().ends_with("_dir")) {
+                                auto vpk = GetOrOpenVpk(candidate.string());
+                                if (vpk) {
+                                    auto data = vpk->readEntry(relPath);
+                                    if (data.has_value()) {
+                                        out = std::move(*data);
+                                        errorOut.clear();
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch (const std::exception&) {
+                        // Ignore and keep searching other search paths.
+                    }
+                }
             }
         }
 
@@ -590,6 +697,105 @@ private:
         return true;
     }
 
+    // Garry's Mod loads legacy/local addons (not Workshop-synced ones, which live in the
+    // Steam Workshop content cache instead) from "<gmodRoot>/garrysmod/addons/<addon>/".
+    // These are never listed in gameinfo.txt - the engine mounts every immediate
+    // subfolder here dynamically at runtime - so without this, any model shipped inside
+    // a legacy addon folder is invisible to the indexer even though the game itself can
+    // see and load it fine. Only addon subfolders that actually contain a "models" (or
+    // "materials") folder are treated as valid content sources, mirroring how the engine
+    // decides an addon folder is worth mounting.
+    static void AppendGModAddonSearchPaths(const fs::path& gameRootPath, vector<SearchPath>& searchPaths) {
+        fs::path addonsDir = gameRootPath / "garrysmod" / "addons";
+        if (!fs::exists(addonsDir) || !fs::is_directory(addonsDir)) return;
+
+        try {
+            for (const auto& entry : fs::directory_iterator(addonsDir, fs::directory_options::skip_permission_denied)) {
+                if (!entry.is_directory()) continue;
+
+                fs::path addonPath = entry.path();
+                bool hasModels = fs::exists(addonPath / "models") && fs::is_directory(addonPath / "models");
+                bool hasMaterials = fs::exists(addonPath / "materials") && fs::is_directory(addonPath / "materials");
+
+                if (hasModels || hasMaterials) {
+                    SearchPath sp;
+                    sp.path = addonPath.lexically_normal();
+                    searchPaths.push_back(sp);
+                }
+            }
+        }
+        catch (const std::exception& e) {
+            cerr << "[AssetManager] Error scanning GMod addons folder " << addonsDir << ": " << e.what() << '\n';
+        }
+    }
+
+    // Garry's Mod supports mounting other installed Source Engine games' content via
+    // "<gmodRoot>/garrysmod/cfg/mount.cfg", a simple KeyValues-style text file:
+    //
+    //   "mountcfg"
+    //   {
+    //       "cstrike"   "C:\...\Counter-Strike Source Dedicated Server\cstrike"
+    //       "tf"        "C:\mytf2server\tf"
+    //   }
+    //
+    // Lines starting with "//" are comments (including the two commented-out example
+    // lines Valve ships inside the block by default, which must be ignored - not treated
+    // as real mounts). Every uncommented "key" "path" pair inside the block is an extra
+    // folder GMod mounts at runtime, and needs to be scanned the same way any other
+    // plain-folder search path is, so models from the mounted game appear in the list.
+    static void AppendGModMountCfgSearchPaths(const fs::path& gameRootPath, vector<SearchPath>& searchPaths) {
+        fs::path mountCfgPath = gameRootPath / "garrysmod" / "cfg" / "mount.cfg";
+        ifstream file(mountCfgPath);
+        if (!file.is_open()) return;
+
+        string line;
+        bool insideBlock = false;
+
+        while (getline(file, line)) {
+            // Trim leading whitespace so comment/brace detection isn't fooled by indentation.
+            size_t firstNonSpace = line.find_first_not_of(" \t\r\n");
+            if (firstNonSpace == string::npos) continue;
+            string trimmed = line.substr(firstNonSpace);
+
+            // Ignore full-line comments entirely - this also correctly skips the two
+            // commented-out example mount lines Valve ships inside the block.
+            if (trimmed.rfind("//", 0) == 0) continue;
+
+            if (!insideBlock) {
+                if (trimmed.find('{') != string::npos) insideBlock = true;
+                continue;
+            }
+
+            if (trimmed.find('}') != string::npos) break; // End of the mountcfg block
+
+            // Expect a "<key>" "<path>" pair on this line.
+            size_t firstQuote = trimmed.find_first_of('"');
+            if (firstQuote == string::npos) continue;
+            size_t secondQuote = trimmed.find_first_of('"', firstQuote + 1);
+            if (secondQuote == string::npos) continue;
+            size_t thirdQuote = trimmed.find_first_of('"', secondQuote + 1);
+            if (thirdQuote == string::npos) continue;
+            size_t fourthQuote = trimmed.find_first_of('"', thirdQuote + 1);
+            if (fourthQuote == string::npos) continue;
+
+            string mountKey = trimmed.substr(firstQuote + 1, secondQuote - firstQuote - 1);
+            string mountPath = trimmed.substr(thirdQuote + 1, fourthQuote - thirdQuote - 1);
+            if (mountPath.empty()) continue;
+
+            fs::path resolvedMountPath = fs::path(mountPath).lexically_normal();
+            if (!fs::exists(resolvedMountPath) || !fs::is_directory(resolvedMountPath)) {
+                cerr << "[AssetManager] GMod mount.cfg entry \"" << mountKey
+                     << "\" points to a path that doesn't exist: " << mountPath << '\n';
+                continue;
+            }
+
+            SearchPath sp;
+            sp.path = resolvedMountPath;
+            searchPaths.push_back(sp);
+
+            cerr << "[AssetManager] GMod mount.cfg mounted \"" << mountKey << "\" -> " << mountPath << '\n';
+        }
+    }
 
     static vector<SearchPath> ParseGameInfo(const fs::path& gameinfoPath, const fs::path& engineRoot, const fs::path& gameinfoFolder) {
         vector<SearchPath> resolvedPaths;
@@ -661,6 +867,35 @@ private:
         fs::path vpkCompanion = dirPath.parent_path() / (dirPath.filename().string() + "_dir.vpk");
         if (fs::exists(vpkCompanion)) {
             ScanVpkForModels(vpkCompanion, out);
+        }
+
+        // Newer Source games (Portal 2, Left 4 Dead 2, CS:GO, Alien Swarm and Alien
+        // Swarm: Reactive Drop) instead pack their base content INSIDE the mod folder
+        // itself as one or more "*_dir.vpk" archives (e.g. "portal2/pak01_dir.vpk"),
+        // rather than as a sibling "<foldername>_dir.vpk" next to it. Without checking
+        // for this too, virtually all of these games' models (which live only inside
+        // those VPKs) go completely undetected even though the plain "models" folder
+        // check below finds nothing on disk to fall back on.
+        //
+        // Rather than assuming a fixed "pakNN" naming scheme (some games use different
+        // prefixes/numbering - e.g. Alien Swarm: Reactive Drop's own base content isn't
+        // necessarily named "pak01"/"pak02"), scan every "*_dir.vpk" archive found
+        // directly inside the mod folder itself. This also naturally covers any number
+        // of incrementally-numbered pak files (pak01, pak02, pak03, ...) without having
+        // to guess how many there are or what they're called.
+        if (fs::exists(dirPath) && fs::is_directory(dirPath)) {
+            try {
+                for (const auto& entry : fs::directory_iterator(dirPath, fs::directory_options::skip_permission_denied)) {
+                    if (!entry.is_regular_file()) continue;
+                    const fs::path& candidate = entry.path();
+                    if (candidate.extension() == ".vpk" && candidate.stem().string().ends_with("_dir")) {
+                        ScanVpkForModels(candidate, out);
+                    }
+                }
+            }
+            catch (const std::exception& e) {
+                cerr << "[AssetManager] Error scanning for *_dir.vpk in " << dirPath << ": " << e.what() << '\n';
+            }
         }
 
         if (!fs::exists(dirPath) || !fs::is_directory(dirPath)) return;

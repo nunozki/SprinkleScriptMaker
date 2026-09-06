@@ -218,19 +218,36 @@ int main() {
             // Trigger asset indexing if selected game changes or on initial boot.
             // Runs on a background thread so the window shows/renders immediately instead
             // of freezing for the whole (potentially slow) scan duration.
-            if (selectedGameIndex != lastSelectedGameIndex && !isIndexingAssets.load()) {
+            if (selectedGameIndex != lastSelectedGameIndex) {
                 lastSelectedGameIndex = selectedGameIndex;
                 gameJustChanged = true; // Model selection/preview state below belongs to the old game and must be reset
 
-                if (indexingThread.joinable()) indexingThread.join(); // Previous scan already finished by now
+                // Bump the index generation FIRST so any still-running scan for the
+                // previous game notices (via SourceAssetManager::IndexGeneration) and
+                // stops itself at its next checkpoint, instead of racing with - and
+                // possibly overwriting - the new game's own scan below.
+                uint64_t myGeneration = ++SourceAssetManager::IndexGeneration;
+
+                // Detach rather than join: the old thread is now abandoning its work as
+                // soon as it notices the generation bump, but it may still be mid-task
+                // (e.g. inside a VPK read) - waiting for it here would just re-introduce
+                // the freeze this change is meant to avoid. It's safe to let it finish
+                // and exit on its own in the background; it no longer touches anything
+                // this new run depends on once it observes the stale generation.
+                if (indexingThread.joinable()) indexingThread.detach();
 
                 isIndexingAssets = true;
                 string gameRootPath = detectedGames[selectedGameIndex].path;
-                indexingThread = std::thread([gameRootPath, &pendingIndexedModels, &indexingResultReady, &isIndexingAssets]() {
-                    auto result = SourceAssetManager::IndexGameModels(gameRootPath);
-                    pendingIndexedModels = std::move(result);
-                    indexingResultReady = true;
-                    isIndexingAssets = false;
+                indexingThread = std::thread([gameRootPath, myGeneration, &pendingIndexedModels, &indexingResultReady, &isIndexingAssets]() {
+                    auto result = SourceAssetManager::IndexGameModels(gameRootPath, myGeneration);
+                    // Only publish results/clear the "indexing" flag if this run is still
+                    // the current one - an even newer game switch may have started another
+                    // run (and bumped the generation again) while this one was finishing up.
+                    if (SourceAssetManager::IndexGeneration.load() == myGeneration) {
+                        pendingIndexedModels = std::move(result);
+                        indexingResultReady = true;
+                        isIndexingAssets = false;
+                    }
                 });
             }
 
@@ -653,6 +670,27 @@ int main() {
         // --- IMGUI VIEWPORT (embedded child, not a floating window) ---
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "3D Model Preview");
+
+        // Skin selector: only shown when the currently previewed model exposes more
+        // than one skin family, listing each one by its index (0-based, matching the
+        // numbers used by the "skin" console command/entity keyvalue in-game).
+        if (previewModel.loaded && previewModel.GetSkinCount() > 1) {
+            string skinLabel = "Skin " + std::to_string(previewModel.currentSkin);
+            ImGui::SetNextItemWidth(150.0f);
+            if (ImGui::BeginCombo("##SkinSelector", skinLabel.c_str())) {
+                for (int i = 0; i < previewModel.GetSkinCount(); ++i) {
+                    bool isSelected = (previewModel.currentSkin == i);
+                    string entryLabel = "Skin " + std::to_string(i);
+                    if (ImGui::Selectable(entryLabel.c_str(), isSelected)) {
+                        previewModel.SetSkin(i);
+                    }
+                    if (isSelected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%d skins available)", previewModel.GetSkinCount());
+        }
 
         if (ImGui::BeginChild("ModelPreviewRegion", ImVec2(0, 0), true)) {
             // Get available region size inside the child
