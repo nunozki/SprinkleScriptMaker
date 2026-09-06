@@ -14,6 +14,7 @@
 #include "headers/SteamDetector.h"
 #include "headers/SourceAssetManager.h" 
 #include "headers/ModelRenderer.h"
+#include "headers/HammerDetector.h"
 #include <algorithm>
 #include <cmath>
 #include <thread>
@@ -112,6 +113,17 @@ int main() {
     if (!window) { glfwTerminate(); return -1; }
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
+
+    // Maximize on startup so all panels (including the 3D preview) have enough
+    // room to lay out correctly on the very first frame. Without this, ImGui's
+    // content-region calculations for the preview child can come out at/near
+    // zero on a small initial window, making the viewport effectively invisible
+    // until the user manually resizes the window and forces a relayout.
+    glfwMaximizeWindow(window);
+
+    // Let the maximize take effect and give GLFW/ImGui a settled framebuffer
+    // size before the first real frame is built.
+    glfwPollEvents();
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -354,7 +366,11 @@ int main() {
             gameJustChanged = false;
         }
 
-        if (ImGui::BeginChild("ModelListRegion", ImVec2(0, 180), true, ImGuiWindowFlags_HorizontalScrollbar)) {
+        // Let the user resize the model list panel by dragging a splitter bar
+        // with the mouse (drag up/down), similar to typical dockable panels.
+        static float modelListHeight = 180.0f;
+
+        if (ImGui::BeginChild("ModelListRegion", ImVec2(0, modelListHeight), true, ImGuiWindowFlags_HorizontalScrollbar)) {
             // Snapshot copy so we don't race with the background indexing thread while it
             // publishes a new index (e.g. right after switching games).
             //
@@ -398,6 +414,18 @@ int main() {
             }
         }
         ImGui::EndChild();
+
+        // Splitter bar: drag with the mouse to resize the model list panel above.
+        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_Separator));
+        ImGui::Button("##ModelListSplitter", ImVec2(-1, 6));
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        }
+        if (ImGui::IsItemActive()) {
+            modelListHeight += ImGui::GetIO().MouseDelta.y;
+            modelListHeight = std::clamp(modelListHeight, 80.0f, 600.0f);
+        }
 
         ImGui::Spacing();
         if (ImGui::Button("Add Selected Model to Script")) {
@@ -452,6 +480,40 @@ int main() {
                 }
                 else {
                     statusMessage = "Error: Could not save to the selected location.";
+                }
+            }
+        }
+
+        // "Save to Hammer" auto-detects Hammer++ (32/64-bit, incl. the win64 folder
+        // name used by Garry's Mod) or a stock Hammer install for the currently
+        // selected game, and drops the preset straight into its sprinkle scripts
+        // folder - no save dialog needed.
+        if (!hasErrors) {
+            ImGui::SameLine();
+        }
+        if (ImGui::Button("Save to Hammer", ImVec2(150, 40))) {
+            if (detectedGames.empty()) {
+                statusMessage = "Error: No Source Engine game selected/detected.";
+            }
+            else {
+                fs::path savePath = HammerDetector::ResolvePresetSavePath(
+                    detectedGames[selectedGameIndex].path, uiPresetName);
+
+                if (savePath.empty()) {
+                    statusMessage = "Error: No Hammer or Hammer++ installation found for "
+                        + detectedGames[selectedGameIndex].name + ".";
+                }
+                else {
+                    std::string outputText = SprinkleWriter::Generate(uiPresetName, uiClassname, uiGrid, uiVariations);
+                    std::ofstream outFile(savePath);
+                    if (outFile.is_open()) {
+                        outFile << outputText;
+                        outFile.close();
+                        statusMessage = "Success: Preset saved to " + savePath.string();
+                    }
+                    else {
+                        statusMessage = "Error: Could not save to " + savePath.string();
+                    }
                 }
             }
         }
@@ -592,7 +654,7 @@ int main() {
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "3D Model Preview");
 
-        if (ImGui::BeginChild("ModelPreviewRegion", ImVec2(0, 400), true)) {
+        if (ImGui::BeginChild("ModelPreviewRegion", ImVec2(0, 0), true)) {
             // Get available region size inside the child
             ImVec2 panelSize = ImGui::GetContentRegionAvail();
             if (panelSize.x < 50) panelSize.x = 50;
