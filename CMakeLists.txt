@@ -51,6 +51,7 @@ add_executable(SprinkleScriptMaker
     src/headers/SourceAssetManager.h
     src/headers/ViewportFBO.h
     src/headers/ModelRenderer.h
+    src/headers/HammerDetector.h
     ${IMGUI_SOURCES}
 )
 
