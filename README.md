@@ -6,6 +6,11 @@ Writing Sprinkle presets by hand means typing model paths from memory, guessing 
 
 > **Platform:** Windows only (it uses the Windows Registry to find Steam, and the Win32 OpenGL driver).
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="SprinkleScriptMaker editing the Jungle Foliage example preset for Team Fortress 2, with island_plant01.mdl shown textured in the 3D preview" width="720">
+</p>
+<p align="center"><em>Editing the <code>examples/jungle_foliage.txt</code> preset with Team Fortress 2's models indexed, and <code>island_plant01.mdl</code> in the 3D preview.</em></p>
+
 ---
 
 ## Table of Contents
