@@ -11,7 +11,7 @@ malformed or mismatched .vtx (wrong dx-level variant, stale file colliding
 inside a VPK, truncated/corrupt data, etc.) can therefore produce an
 out-of-range span construction, which trips a fatal MSVC debug-iterator
 _STL_VERIFY check and fails the whole process - __try/__except cannot catch
-this failure (see src/headers/ModelRenderer.h for details).
+this failure (see src/render/ModelRenderer.cpp for details).
 
 This patch adds bounds checks around the three span constructions in
 VTX::open() so an out-of-range strip is simply left with an empty span instead

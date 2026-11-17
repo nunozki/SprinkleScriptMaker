@@ -105,7 +105,7 @@ The file name comes from the preset name, converted to lowercase with underscore
 
 ## 📄 Sprinkle Script Format
 
-A Sprinkle preset is a KeyValues file with one `base` block, whose keys every placed entity gets, followed by any number of weighted variations. This is what the app writes (see [`jungle_foliage.txt`](jungle_foliage.txt) for a commented example):
+A Sprinkle preset is a KeyValues file with one `base` block, whose keys every placed entity gets, followed by any number of weighted variations. This is what the app writes (see [`examples/jungle_foliage.txt`](examples/jungle_foliage.txt) for a commented example):
 
 ```
 "Example: Jungle Foliage"
@@ -195,24 +195,34 @@ During configure, CMake applies [`patches/sourcepp-vtx-bounds-check.patch`](patc
 
 ```
 SprinkleScriptMaker/
-├── CMakeLists.txt                 # Build script; fetches dependencies and applies patches
-├── jungle_foliage.txt             # Commented example Sprinkle preset
-├── patches/                       # Patches applied to fetched third-party code
+├── CMakeLists.txt                  # Build script; fetches dependencies and applies patches
+├── examples/
+│   └── jungle_foliage.txt          # Commented example Sprinkle preset
+├── patches/                        # Patches applied to fetched third-party code
 │   ├── README.md
 │   ├── apply-sourcepp-patches.cmake
 │   └── sourcepp-vtx-bounds-check.patch
+├── third_party/
+│   └── portable-file-dialogs/      # Native open/save dialogs (single header)
 └── src/
-    ├── main.cpp                   # Window, ImGui interface and main loop
-    └── headers/
-        ├── SteamDetector.h        # Finds Steam libraries and installed Source games
-        ├── SourceAssetManager.h   # gameinfo.txt parsing, VPK/folder model indexing, disk cache
-        ├── HammerDetector.h       # Finds Hammer / Hammer++ and resolves the preset folder
-        ├── ModelRenderer.h        # Loads .mdl/.vtx/.vvd and VMT/VTF materials, draws the preview
-        ├── ViewportFBO.h          # Offscreen framebuffer for the 3D preview
-        ├── SprinkleReader.h       # Parses existing Sprinkle .txt presets
-        ├── SprinkleWriter.h       # Generates Sprinkle .txt presets
-        └── portable-file-dialogs.h  # Native open/save dialogs (third-party)
+    ├── main.cpp                    # Window, ImGui interface and main loop
+    ├── sprinkle/
+    │   ├── SprinklePreset.h        # SprinklePreset / SprinkleVariation data types
+    │   ├── SprinkleReader.h/.cpp   # Parses existing Sprinkle .txt presets
+    │   └── SprinkleWriter.h/.cpp   # Generates and saves Sprinkle .txt presets
+    ├── platform/
+    │   ├── SteamDetector.h/.cpp    # Finds Steam libraries and installed Source games
+    │   └── HammerDetector.h/.cpp   # Finds Hammer / Hammer++ and resolves the preset folder
+    ├── assets/
+    │   └── SourceAssetManager.h/.cpp  # gameinfo.txt parsing, VPK/folder indexing, disk cache
+    ├── render/
+    │   ├── ModelRenderer.h/.cpp    # Loads .mdl/.vtx/.vvd and VMT/VTF materials, draws the preview
+    │   └── ViewportFBO.h/.cpp      # Offscreen framebuffer for the 3D preview
+    └── util/
+        └── StringUtils.h/.cpp      # Quoted-token parsing shared by the text file readers
 ```
+
+Each module is a header with declarations only and a `.cpp` with the implementation. Internal helpers and state live in an anonymous namespace in the `.cpp`, so they don't leak into other files. Includes are relative to `src/`, for example `#include "assets/SourceAssetManager.h"`.
 
 ---
 
@@ -220,7 +230,7 @@ SprinkleScriptMaker/
 
 - **Windows only.** Steam detection uses the registry and rendering uses `opengl32` directly.
 - **Limited per-variation keys.** Only `model`, `skin` and `ignorenormals` are edited and saved. Other keyvalues in a loaded file (e.g. `modelscale`, `rendercolor`, extra `base` keys) are dropped when you save again.
-- **Simple preset reader.** The loader reads files line by line and expects the layout the Sprinkle tool normally uses (one key per line, as in `jungle_foliage.txt`). Unusual formatting may not load correctly.
+- **Simple preset reader.** The loader reads files line by line and expects the layout the Sprinkle tool normally uses (one key per line, as in `examples/jungle_foliage.txt`). Unusual formatting may not load correctly.
 - **Garry's Mod `.gma` addons aren't indexed.** Only folder-based addons in `garrysmod/addons` are scanned. Workshop `.gma` packages aren't read.
 - **Alien Swarm** and **Alien Swarm: Reactive Drop** support is still in progress.
 - **Source 2 isn't supported** (Counter-Strike 2, Half-Life: Alyx, etc.).

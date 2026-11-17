@@ -24,7 +24,7 @@ message(STATUS "Downloading SourcePP...")
 # local patch (adds bounds checks around the offending spans) right after the
 # source is fetched, so every configure gets the fix regardless of GIT_TAG updates.
 # See patches/README.md, patches/sourcepp-vtx-bounds-check.patch, and
-# src/headers/ModelRenderer.h.
+# src/render/ModelRenderer.cpp.
 #
 # GIT_TAG is pinned to a specific commit (rather than floating "main") precisely so
 # this patch's line-context stays valid; bumping the pin requires re-validating
@@ -62,7 +62,9 @@ message(STATUS "Downloading Dear ImGui...")
 FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG master)
 FetchContent_Populate(imgui)
 
-set(IMGUI_SOURCES
+# Dear ImGui has no CMake build of its own: compile it (with the GLFW + OpenGL 3
+# backends) as a small static library that the app links against.
+add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_demo.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -72,26 +74,68 @@ set(IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
     ${imgui_SOURCE_DIR}/misc/cpp/imgui_stdlib.cpp
 )
-
-add_executable(SprinkleScriptMaker 
-    src/main.cpp
-    src/headers/SprinkleWriter.h
-    src/headers/SprinkleReader.h
-    src/headers/portable-file-dialogs.h
-    src/headers/SteamDetector.h
-    src/headers/SourceAssetManager.h
-    src/headers/ViewportFBO.h
-    src/headers/ModelRenderer.h
-    src/headers/HammerDetector.h
-    ${IMGUI_SOURCES}
-)
-
-target_link_libraries(SprinkleScriptMaker PRIVATE sourcepp::vpkpp sourcepp::mdlpp sourcepp::vtfpp sourcepp::kvpp glfw opengl32)
-
-target_include_directories(SprinkleScriptMaker PRIVATE 
-    ${sourcepp_SOURCE_DIR}/include
+target_include_directories(imgui PUBLIC
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
     ${imgui_SOURCE_DIR}/misc/cpp
+)
+target_link_libraries(imgui PUBLIC glfw opengl32)
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+# Each module is a .h (declarations) + .cpp (implementation) pair. Headers are
+# listed too so IDEs show them in the project tree.
+set(APP_SOURCES
+    src/main.cpp
+
+    # Sprinkle preset model, reader and writer
+    src/sprinkle/SprinklePreset.h
+    src/sprinkle/SprinkleReader.h
+    src/sprinkle/SprinkleReader.cpp
+    src/sprinkle/SprinkleWriter.h
+    src/sprinkle/SprinkleWriter.cpp
+
+    # Steam and Hammer installation detection
+    src/platform/SteamDetector.h
+    src/platform/SteamDetector.cpp
+    src/platform/HammerDetector.h
+    src/platform/HammerDetector.cpp
+
+    # Game asset indexing and loading (VPK + loose files)
+    src/assets/SourceAssetManager.h
+    src/assets/SourceAssetManager.cpp
+
+    # 3D preview
+    src/render/ModelRenderer.h
+    src/render/ModelRenderer.cpp
+    src/render/ViewportFBO.h
+    src/render/ViewportFBO.cpp
+
+    # Shared helpers
+    src/util/StringUtils.h
+    src/util/StringUtils.cpp
+
+    # Third-party single-header libraries
+    third_party/portable-file-dialogs/portable-file-dialogs.h
+)
+
+add_executable(SprinkleScriptMaker ${APP_SOURCES})
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${APP_SOURCES})
+
+target_include_directories(SprinkleScriptMaker PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/portable-file-dialogs
+    ${sourcepp_SOURCE_DIR}/include
     ${CMAKE_BINARY_DIR}/_deps/tsl_hat_trie-src/include
+)
+
+target_link_libraries(SprinkleScriptMaker PRIVATE
+    imgui
+    sourcepp::vpkpp
+    sourcepp::mdlpp
+    sourcepp::vtfpp
+    sourcepp::kvpp
+    glfw
+    opengl32
 )
